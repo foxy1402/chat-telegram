@@ -130,8 +130,19 @@ ALLOWED_USER_IDS=123456789,987654321
 # Default provider (groq, gemini, or openrouter)
 DEFAULT_PROVIDER=groq
 
-# Default Groq model
-GROQ_MODEL=llama-3.3-70b-versatile
+# Response Configuration (Control response length and style)
+# Maximum tokens per response (lower = shorter responses, less TPM usage)
+# Recommended: 512 (concise), 1024 (balanced), 2048 (detailed)
+MAX_TOKENS=512
+
+# Temperature (0.0-1.0): 0.7 balanced, 0.3 focused, 0.9 creative
+TEMPERATURE=0.7
+
+# Maximum conversation history messages
+MAX_HISTORY_MESSAGES=20
+
+# System prompt to guide AI behavior (instructs AI to be concise)
+SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the point. Avoid unnecessary explanations unless specifically asked.
 ```
 
 ---

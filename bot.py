@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ALLOWED_USER_IDS = [uid.strip() for uid in os.getenv('ALLOWED_USER_IDS', '').split(',') if uid.strip()]
 DEFAULT_PROVIDER = os.getenv('DEFAULT_PROVIDER', 'groq')
-MAX_TOKENS = int(os.getenv('MAX_TOKENS', '2048'))  # Configurable token limit
+MAX_TOKENS = int(os.getenv('MAX_TOKENS', '512'))  # Configurable token limit (lower = more concise)
+TEMPERATURE = float(os.getenv('TEMPERATURE', '0.7'))  # Configurable temperature (0.0-1.0)
 MAX_HISTORY_MESSAGES = int(os.getenv('MAX_HISTORY_MESSAGES', '20'))  # Configurable history length
+SYSTEM_PROMPT = os.getenv('SYSTEM_PROMPT', 'You are a helpful AI assistant. Be concise and straight to the point. Avoid unnecessary explanations unless specifically asked.')
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
@@ -172,10 +174,15 @@ class GroqProvider(AIProvider):
     
     def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
         model = model or self.default_model
+        # Inject system prompt if not already present
+        chat_messages = messages.copy()
+        if not any(msg.get('role') == 'system' for msg in chat_messages):
+            chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        
         response = self.client.chat.completions.create(
-            messages=messages,
+            messages=chat_messages,
             model=model,
-            temperature=0.7,
+            temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
         )
         return response.choices[0].message.content
@@ -252,11 +259,22 @@ class GeminiProvider(AIProvider):
             raise ValueError("Messages list cannot be empty")
         
         model_name = model or self.default_model
-        model = self.genai.GenerativeModel(model_name)
+        # Configure model with system prompt and generation settings
+        generation_config = {
+            "temperature": TEMPERATURE,
+            "max_output_tokens": MAX_TOKENS,
+        }
+        model = self.genai.GenerativeModel(
+            model_name,
+            generation_config=generation_config,
+            system_instruction=SYSTEM_PROMPT
+        )
         
-        # Convert messages to Gemini format
+        # Convert messages to Gemini format (skip system messages as they're in system_instruction)
         chat_history = []
         for msg in messages[:-1]:  # All except last
+            if msg["role"] == "system":
+                continue  # Skip system messages, already in system_instruction
             role = "user" if msg["role"] == "user" else "model"
             chat_history.append({"role": role, "parts": [msg["content"]]})
         
@@ -351,10 +369,15 @@ class OpenRouterProvider(AIProvider):
     
     def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
         model = model or self.default_model
+        # Inject system prompt if not already present
+        chat_messages = messages.copy()
+        if not any(msg.get('role') == 'system' for msg in chat_messages):
+            chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        
         response = self.client.chat.completions.create(
             model=model,
-            messages=messages,
-            temperature=0.7,
+            messages=chat_messages,
+            temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
         )
         return response.choices[0].message.content
