@@ -28,6 +28,7 @@ SYSTEM_PROMPT = os.getenv('SYSTEM_PROMPT', 'You are a helpful AI assistant. Be c
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+CEREBRAS_API_KEY = os.getenv('CEREBRAS_API_KEY')
 
 # Model validation cache file
 VALIDATED_MODELS_CACHE = os.path.join(os.path.dirname(__file__), 'validated_models.json')
@@ -482,6 +483,88 @@ class OpenRouterProvider(AIProvider):
         return self.default_model
 
 
+class CerebrasProvider(AIProvider):
+    """Cerebras AI Provider with Dynamic Model Detection"""
+    
+    def __init__(self, api_key: str):
+        from cerebras.cloud.sdk import Cerebras
+        self.client = Cerebras(api_key=api_key)
+        # Smart default: Use the best free tier model
+        self.default_model = "gpt-oss-120b"
+        self._cached_models = None
+    
+    def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
+        model = model or self.default_model
+        # Inject system prompt if not already present
+        chat_messages = messages.copy()
+        if not any(msg.get('role') == 'system' for msg in chat_messages):
+            chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        
+        response = self.client.chat.completions.create(
+            messages=chat_messages,
+            model=model,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
+        return response.choices[0].message.content
+    
+    def get_available_models(self) -> List[Dict[str, str]]:
+        """Dynamically fetch available models from Cerebras API"""
+        # Use cached models if available (refresh every bot restart)
+        if self._cached_models:
+            return self._cached_models
+        
+        try:
+            # Fetch models from Cerebras API
+            models_response = self.client.models.list()
+            
+            # Filter for chat models and sort by quality
+            chat_models = []
+            for model in models_response.data:
+                # Only include active models
+                if hasattr(model, 'id'):
+                    model_info = {
+                        "id": model.id,
+                        "name": self._format_model_name(model.id)
+                    }
+                    chat_models.append(model_info)
+            
+            # Future-proof ranking: Use capability scoring
+            chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
+            self._cached_models = chat_models
+            
+            logger.info(f"✅ Cerebras: Detected {len(chat_models)} available models")
+            return chat_models
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Cerebras: Could not fetch models dynamically: {e}")
+            # Fallback to known models
+            return self._get_fallback_models()
+    
+    def _format_model_name(self, model_id: str) -> str:
+        """Format model ID into readable name"""
+        # Convert model IDs like 'llama-3.3-70b' to 'Llama 3.3 70B'
+        name = model_id.replace('-', ' ').title()
+        return name
+    
+    def _get_fallback_models(self) -> List[Dict[str, str]]:
+        """Fallback models if API detection fails (ranked smartest to least capable)"""
+        return [
+            # Free tier models (stable)
+            {"id": "gpt-oss-120b", "name": "GPT-OSS 120B (Recommended)"},
+            {"id": "llama3.1-8b", "name": "Llama 3.1 8B (Fast)"},
+            # Preview models (trial - may be removed anytime)
+            {"id": "qwen-3-235b-a22b-instruct-2507", "name": "Qwen 3 235B (Preview)"},
+            {"id": "zai-glm-4.7", "name": "ZAI GLM 4.7 (Preview)"},
+        ]
+    
+    def get_name(self) -> str:
+        return "Cerebras"
+    
+    def get_default_model(self) -> str:
+        return self.default_model
+
+
 # ============================================================================
 # PROVIDER MANAGER
 # ============================================================================
@@ -515,6 +598,13 @@ class ProviderManager:
                 logger.info("✅ OpenRouter provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize OpenRouter: {e}")
+        
+        if CEREBRAS_API_KEY:
+            try:
+                self.providers['cerebras'] = CerebrasProvider(CEREBRAS_API_KEY)
+                logger.info("✅ Cerebras provider initialized")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize Cerebras: {e}")
         
         if not self.providers:
             raise ValueError("No AI providers available! Please set at least one API key.")
@@ -1073,7 +1163,7 @@ async def verified_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     validated_models = [m for m in all_models if m['id'] in validated_ids]
     
     # Get current model
-    current_model = session["model"] or provider.get_default_model()
+    current_model = session["models"].get(provider_name) or provider.get_default_model()
     
     # Build model list
     model_list = "\n".join([
@@ -1204,10 +1294,10 @@ def main():
         raise ValueError("TELEGRAM_TOKEN environment variable is required!")
     
     # Check if at least one provider API key is set
-    if not (GROQ_API_KEY or GEMINI_API_KEY or OPENROUTER_API_KEY):
+    if not (GROQ_API_KEY or GEMINI_API_KEY or OPENROUTER_API_KEY or CEREBRAS_API_KEY):
         raise ValueError(
             "At least one AI provider API key is required!\n"
-            "Set one of: GROQ_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY"
+            "Set one of: GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, or CEREBRAS_API_KEY"
         )
     
     # Create the Application

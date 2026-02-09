@@ -3,3 +3,4 @@ groq==0.13.0
 google-generativeai==0.8.3
 openai==1.59.5
 requests==2.31.0
+cerebras_cloud_sdk

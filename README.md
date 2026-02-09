@@ -8,7 +8,7 @@
 
 ## ✨ Features
 
-- 🔄 **Multiple AI Providers**: Groq, Google Gemini, OpenRouter
+- 🔄 **Multiple AI Providers**: Groq, Google Gemini, OpenRouter, Cerebras
 - ⚡ **Easy Switching**: Change providers and models with simple commands
 - 🔒 **User Whitelisting**: Restrict access to specific users
 - 💬 **Conversation History**: Maintains context across messages
@@ -28,6 +28,7 @@ You'll need at least **one** of these (all are free):
 | **Groq** | [console.groq.com](https://console.groq.com) | 14,400 requests/day |
 | **Gemini** | [aistudio.google.com](https://aistudio.google.com) | 100-1,000 requests/day |
 | **OpenRouter** | [openrouter.ai](https://openrouter.ai) | 50-1,000 requests/day |
+| **Cerebras** | [cerebras.ai](https://cerebras.ai) | Free tier with fast inference |
 
 ### 2. Get Telegram Bot Token
 
@@ -119,6 +120,7 @@ TELEGRAM_TOKEN=your_telegram_bot_token
 GROQ_API_KEY=your_groq_api_key
 GEMINI_API_KEY=your_gemini_api_key
 OPENROUTER_API_KEY=your_openrouter_api_key
+CEREBRAS_API_KEY=your_cerebras_api_key
 ```
 
 ### Optional
@@ -127,7 +129,7 @@ OPENROUTER_API_KEY=your_openrouter_api_key
 # Restrict access to specific users (comma-separated)
 ALLOWED_USER_IDS=123456789,987654321
 
-# Default provider (groq, gemini, or openrouter)
+# Default provider (groq, gemini, openrouter, or cerebras)
 DEFAULT_PROVIDER=groq
 
 # Response Configuration (Control response length and style)
@@ -141,8 +143,9 @@ TEMPERATURE=0.7
 # Maximum conversation history messages
 MAX_HISTORY_MESSAGES=20
 
-# System prompt to guide AI behavior (instructs AI to be concise)
-SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the point. Avoid unnecessary explanations unless specifically asked.
+# System prompt to guide AI behavior
+# Instructs AI to be concise and use Telegram-friendly formatting (no tables)
+SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the point. Avoid unnecessary explanations unless specifically asked. IMPORTANT: Never use markdown tables (|---|---| format) as they are unreadable in Telegram. Instead, use bullet points, numbered lists, or simple line-by-line formatting.
 ```
 
 ---
@@ -153,7 +156,7 @@ SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the poi
 
 - `/provider` - Show current provider and available options
 - `/provider <name>` - Switch to a different provider
-  - Example: `/provider gemini`
+  - Example: `/provider gemini` or `/provider cerebras`
 - `/models` - List available models for current provider
 - `/model <name>` - Switch to a specific model
   - Example: `/model gemini-2.5-pro`
@@ -172,7 +175,7 @@ SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the poi
 You: /start
 Bot: 🤖 Hello! I'm your Multi-Provider AI assistant.
      📡 Current Provider: Groq
-     🔧 Available Providers: groq, gemini, openrouter
+     🔧 Available Providers: groq, gemini, openrouter, cerebras
 
 You: /provider gemini
 Bot: ✅ Switched to Gemini!
@@ -195,6 +198,7 @@ Bot: The capital of France is Paris.
 | Provider | Daily Limit | Best For | Speed |
 |----------|-------------|----------|-------|
 | **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ |
+| **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ |
 | **Gemini** | 100-1,000 | Quality responses | ⚡⚡⚡ |
 | **OpenRouter** | 50-1,000 | Model variety | ⚡⚡ |
 
