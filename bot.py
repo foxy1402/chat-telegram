@@ -29,6 +29,7 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 CEREBRAS_API_KEY = os.getenv('CEREBRAS_API_KEY')
+NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY')
 
 # Model validation cache file
 VALIDATED_MODELS_CACHE = os.path.join(os.path.dirname(__file__), 'validated_models.json')
@@ -565,6 +566,159 @@ class CerebrasProvider(AIProvider):
         return self.default_model
 
 
+class NvidiaProvider(AIProvider):
+    """NVIDIA AI Provider with Thinking/Reasoning Support"""
+    
+    # Models that DON'T support thinking
+    MODELS_WITHOUT_THINKING = {
+        'qwen/qwen3-coder-480b-a35b-instruct',
+        'openai/gpt-oss-120b'
+    }
+    
+    def __init__(self, api_key: str):
+        from openai import OpenAI
+        self.client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=api_key
+        )
+        # Smart default: Use stable free tier model
+        self.default_model = 'openai/gpt-oss-120b'
+        self._cached_models = None
+    
+    def supports_thinking(self, model_id: str) -> bool:
+        """Check if a model supports thinking/reasoning"""
+        return model_id not in self.MODELS_WITHOUT_THINKING
+    
+    def chat(self, messages: List[Dict], model: Optional[str] = None, enable_thinking: bool = False) -> str:
+        model = model or self.default_model
+        # Inject system prompt if not already present
+        chat_messages = messages.copy()
+        if not any(msg.get('role') == 'system' for msg in chat_messages):
+            chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        
+        # Only enable thinking if BOTH: model supports it AND user enabled it
+        should_use_thinking = enable_thinking and self.supports_thinking(model)
+        
+        if should_use_thinking:
+            # Use streaming to capture reasoning content
+            response = self.client.chat.completions.create(
+                messages=chat_messages,
+                model=model,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                extra_body={"chat_template_kwargs": {"thinking": True}},
+                stream=True
+            )
+            
+            # Collect reasoning and content separately
+            reasoning_parts = []
+            content_parts = []
+            
+            for chunk in response:
+                if not getattr(chunk, "choices", None):
+                    continue
+                if len(chunk.choices) == 0:
+                    continue
+                
+                delta = chunk.choices[0].delta
+                
+                # Extract reasoning content
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                
+                # Extract regular content
+                if getattr(delta, "content", None) is not None:
+                    content_parts.append(delta.content)
+            
+            # Combine reasoning and content
+            full_response = ""
+            if reasoning_parts:
+                full_response = "💭 **Thinking:**\n" + "".join(reasoning_parts) + "\n\n"
+            full_response += "".join(content_parts)
+            
+            return full_response
+        else:
+            # Regular non-streaming response
+            response = self.client.chat.completions.create(
+                messages=chat_messages,
+                model=model,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+            )
+            return response.choices[0].message.content
+    
+    def get_available_models(self) -> List[Dict[str, str]]:
+        """Dynamically fetch available models from NVIDIA API"""
+        # Use cached models if available (refresh every bot restart)
+        if self._cached_models:
+            return self._cached_models
+        
+        try:
+            # Fetch models from NVIDIA API
+            models_response = self.client.models.list()
+            
+            # Filter for chat models and sort by quality
+            chat_models = []
+            for model in models_response.data:
+                # Only include active models
+                if hasattr(model, 'id'):
+                    model_info = {
+                        "id": model.id,
+                        "name": self._format_model_name(model.id)
+                    }
+                    chat_models.append(model_info)
+            
+            # Future-proof ranking: Use capability scoring
+            chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
+            self._cached_models = chat_models
+            
+            logger.info(f"✅ NVIDIA: Detected {len(chat_models)} available models")
+            return chat_models
+            
+        except Exception as e:
+            logger.warning(f"⚠️ NVIDIA: Could not fetch models dynamically: {e}")
+            # Fallback to known models
+            return self._get_fallback_models()
+    
+    def _format_model_name(self, model_id: str) -> str:
+        """Format model ID into readable name"""
+        # Extract the model name after the slash
+        if '/' in model_id:
+            name = model_id.split('/')[-1]
+        else:
+            name = model_id
+        
+        # Convert to title case and clean up
+        name = name.replace('-', ' ').title()
+        
+        # Add thinking indicator
+        if self.supports_thinking(model_id):
+            name += " 💭"
+        
+        return name
+    
+    def _get_fallback_models(self) -> List[Dict[str, str]]:
+        """Fallback models if API detection fails (ranked by stability and capability)"""
+        return [
+            # Free tier models (stable)
+            {"id": "openai/gpt-oss-120b", "name": "GPT-OSS 120B (Stable Free Tier)"},
+            {"id": "qwen/qwen3-coder-480b-a35b-instruct", "name": "Qwen3 Coder 480B (Coding)"},
+            # Premium models with thinking (may lose access)
+            {"id": "deepseek-ai/deepseek-v3.2", "name": "DeepSeek V3.2 💭"},
+            {"id": "deepseek-ai/deepseek-v3.1-terminus", "name": "DeepSeek V3.1 Terminus 💭"},
+            {"id": "qwen/qwen3-235b-a22b", "name": "Qwen3 235B 💭"},
+            {"id": "moonshotai/kimi-k2.5", "name": "Kimi K2.5 💭"},
+            {"id": "z-ai/glm4.7", "name": "GLM 4.7 💭"},
+        ]
+    
+    def get_name(self) -> str:
+        return "NVIDIA"
+    
+    def get_default_model(self) -> str:
+        return self.default_model
+
+
 # ============================================================================
 # PROVIDER MANAGER
 # ============================================================================
@@ -605,6 +759,13 @@ class ProviderManager:
                 logger.info("✅ Cerebras provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Cerebras: {e}")
+        
+        if NVIDIA_API_KEY:
+            try:
+                self.providers['nvidia'] = NvidiaProvider(NVIDIA_API_KEY)
+                logger.info("✅ NVIDIA provider initialized")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize NVIDIA: {e}")
         
         if not self.providers:
             raise ValueError("No AI providers available! Please set at least one API key.")
@@ -652,7 +813,8 @@ def get_user_session(user_id: str) -> Dict:
         user_sessions[user_id] = {
             "provider": provider_manager.get_default_provider(),
             "models": {},  # Store model per provider: {"groq": "model-id", "gemini": "model-id"}
-            "history": []
+            "history": [],
+            "thinking_enabled": False  # For NVIDIA thinking models
         }
     return user_sessions[user_id]
 
@@ -818,7 +980,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Just send me any message and I'll respond using your selected AI provider!\n\n"
         "**Provider Management:**\n"
         "• `/provider` - Show current provider and available options\n"
-        "• `/provider <name>` - Switch provider (groq/gemini/openrouter)\n"
+        "• `/provider <name>` - Switch provider (groq/gemini/openrouter/cerebras/nvidia)\n"
         "• `/models` - List verified working models\n"
         "• `/models all` - List all available models from API\n"
         "• `/model <name>` - Switch to a specific model\n"
@@ -827,6 +989,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/validate` - Test all models to see which actually work\n"
         "• `/verified` - Show only validated working models\n"
         "• `/clearvalidation` - Clear validation cache\n\n"
+        "**Thinking Mode (NVIDIA only):**\n"
+        "• `/thinking on` - Enable thinking/reasoning in responses 💭\n"
+        "• `/thinking off` - Disable thinking for concise responses\n\n"
         "**Other Commands:**\n"
         "• `/clear` - Clear conversation history\n"
         "• `/help` - Show this help\n\n"
@@ -1180,6 +1345,75 @@ async def verified_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
+async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle thinking mode on/off for NVIDIA models"""
+    user_id = str(update.effective_user.id)
+    
+    if not is_user_allowed(user_id):
+        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        return
+    
+    session = get_user_session(user_id)
+    provider_name = session["provider"]
+    provider = provider_manager.get_provider(provider_name)
+    
+    # Check if no argument provided
+    if not context.args:
+        current_state = "enabled" if session.get("thinking_enabled", False) else "disabled"
+        await update.message.reply_text(
+            f"💭 **Thinking Mode:** {current_state}\n\n"
+            f"Use `/thinking on` or `/thinking off` to toggle.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Parse argument
+    arg = context.args[0].lower()
+    
+    if arg == 'on':
+        session["thinking_enabled"] = True
+        
+        # Check if current model supports thinking (only for NVIDIA)
+        if provider_name == 'nvidia':
+            current_model = session["models"].get(provider_name) or provider.get_default_model()
+            if hasattr(provider, 'supports_thinking') and provider.supports_thinking(current_model):
+                await update.message.reply_text(
+                    f"✅ **Thinking mode enabled!** 💭\n\n"
+                    f"Model `{current_model}` supports thinking.\n"
+                    f"You'll see reasoning content in responses.",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ **Thinking mode enabled**, but...\n\n"
+                    f"Model `{current_model}` doesn't support thinking.\n"
+                    f"Switch to a model with 💭 icon for thinking support.\n\n"
+                    f"Use `/models all` to see available models.",
+                    parse_mode='Markdown'
+                )
+        else:
+            await update.message.reply_text(
+                f"✅ **Thinking mode enabled!**\n\n"
+                f"Note: Only NVIDIA provider supports thinking.\n"
+                f"Switch to NVIDIA with `/provider nvidia` to use it.",
+                parse_mode='Markdown'
+            )
+    
+    elif arg == 'off':
+        session["thinking_enabled"] = False
+        await update.message.reply_text(
+            f"🔕 **Thinking mode disabled!**\n\n"
+            f"Responses will be more concise.",
+            parse_mode='Markdown'
+        )
+    
+    else:
+        await update.message.reply_text(
+            f"❌ Invalid argument: `{arg}`\n\n"
+            f"Use `/thinking on` or `/thinking off`",
+            parse_mode='Markdown'
+        )
+
 async def clearvalidation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear validation cache for current provider"""
     user_id = str(update.effective_user.id)
@@ -1231,10 +1465,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         provider = provider_manager.get_provider(provider_name)
         current_model = session["models"].get(provider_name)  # None = use provider default
         
-        # Call AI provider
+        # Call AI provider (pass thinking flag for NVIDIA)
+        thinking_enabled = session.get("thinking_enabled", False)
         bot_response = provider.chat(
             messages=session["history"],
-            model=current_model
+            model=current_model,
+            enable_thinking=thinking_enabled
         )
         
         # Add bot response to history
@@ -1294,10 +1530,10 @@ def main():
         raise ValueError("TELEGRAM_TOKEN environment variable is required!")
     
     # Check if at least one provider API key is set
-    if not (GROQ_API_KEY or GEMINI_API_KEY or OPENROUTER_API_KEY or CEREBRAS_API_KEY):
+    if not (GROQ_API_KEY or GEMINI_API_KEY or OPENROUTER_API_KEY or CEREBRAS_API_KEY or NVIDIA_API_KEY):
         raise ValueError(
             "At least one AI provider API key is required!\n"
-            "Set one of: GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, or CEREBRAS_API_KEY"
+            "Set one of: GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, CEREBRAS_API_KEY, or NVIDIA_API_KEY"
         )
     
     # Create the Application
@@ -1314,6 +1550,7 @@ def main():
     application.add_handler(CommandHandler("validate", validate_command))
     application.add_handler(CommandHandler("verified", verified_command))
     application.add_handler(CommandHandler("clearvalidation", clearvalidation_command))
+    application.add_handler(CommandHandler("thinking", thinking_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Start the bot

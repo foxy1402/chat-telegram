@@ -1,6 +1,6 @@
 # 🤖 Multi-Provider AI Telegram Bot
 
-> **A universal free AI model hub for Telegram** - Switch between Groq, Gemini, and OpenRouter with simple commands!
+> **A universal free AI model hub for Telegram** - Switch between Groq, Gemini, OpenRouter, Cerebras, and NVIDIA with simple commands!
 
 [![Docker Hub](https://img.shields.io/badge/docker-snoopylikefree5%2Fmulti--ai--bot-blue?logo=docker)](https://hub.docker.com/r/snoopylikefree5/multi-ai-bot)
 
@@ -8,7 +8,8 @@
 
 ## ✨ Features
 
-- 🔄 **Multiple AI Providers**: Groq, Google Gemini, OpenRouter, Cerebras
+- 🔄 **Multiple AI Providers**: Groq, Google Gemini, OpenRouter, Cerebras, NVIDIA
+- 💭 **Thinking Mode**: See AI reasoning process with NVIDIA models (NEW!)
 - ⚡ **Easy Switching**: Change providers and models with simple commands
 - 🔒 **User Whitelisting**: Restrict access to specific users
 - 💬 **Conversation History**: Maintains context across messages
@@ -29,6 +30,7 @@ You'll need at least **one** of these (all are free):
 | **Gemini** | [aistudio.google.com](https://aistudio.google.com) | 100-1,000 requests/day |
 | **OpenRouter** | [openrouter.ai](https://openrouter.ai) | 50-1,000 requests/day |
 | **Cerebras** | [cerebras.ai](https://cerebras.ai) | Free tier with fast inference |
+| **NVIDIA** | [build.nvidia.com](https://build.nvidia.com) | Free tier with thinking models 💭 |
 
 ### 2. Get Telegram Bot Token
 
@@ -61,6 +63,8 @@ docker run -d \
   -e GROQ_API_KEY=your_groq_api_key \
   -e GEMINI_API_KEY=your_gemini_api_key \
   -e OPENROUTER_API_KEY=your_openrouter_api_key \
+  -e CEREBRAS_API_KEY=your_cerebras_api_key \
+  -e NVIDIA_API_KEY=your_nvidia_api_key \
   -e ALLOWED_USER_IDS=your_telegram_user_id \
   --name multi-ai-bot \
   snoopylikefree5/multi-ai-bot:latest
@@ -121,6 +125,7 @@ GROQ_API_KEY=your_groq_api_key
 GEMINI_API_KEY=your_gemini_api_key
 OPENROUTER_API_KEY=your_openrouter_api_key
 CEREBRAS_API_KEY=your_cerebras_api_key
+NVIDIA_API_KEY=your_nvidia_api_key
 ```
 
 ### Optional
@@ -129,7 +134,7 @@ CEREBRAS_API_KEY=your_cerebras_api_key
 # Restrict access to specific users (comma-separated)
 ALLOWED_USER_IDS=123456789,987654321
 
-# Default provider (groq, gemini, openrouter, or cerebras)
+# Default provider (groq, gemini, openrouter, cerebras, or nvidia)
 DEFAULT_PROVIDER=groq
 
 # Response Configuration (Control response length and style)
@@ -156,15 +161,31 @@ SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the poi
 
 - `/provider` - Show current provider and available options
 - `/provider <name>` - Switch to a different provider
-  - Example: `/provider gemini` or `/provider cerebras`
-- `/models` - List available models for current provider
+  - Example: `/provider gemini`, `/provider cerebras`, or `/provider nvidia`
+- `/models` - List verified working models for current provider
+- `/models all` - List all available models from API
 - `/model <name>` - Switch to a specific model
   - Example: `/model gemini-2.5-pro`
+
+### Thinking Mode (NVIDIA Only) 💭
+
+- `/thinking on` - Enable thinking/reasoning mode (shows AI's thought process)
+- `/thinking off` - Disable thinking mode (more concise responses)
+- `/thinking` - Check current thinking mode status
+
+**Note:** Only NVIDIA provider supports thinking mode. Models with 💭 icon support this feature.
+
+### Model Validation
+
+- `/validate` - Test all models to see which actually work
+- `/verified` - Show only validated working models
+- `/clearvalidation` - Clear validation cache and re-test
 
 ### Other Commands
 
 - `/start` - Show welcome message
 - `/clear` - Clear conversation history
+- `/refresh` - Refresh model lists from providers
 - `/help` - Show help message
 
 ---
@@ -175,32 +196,43 @@ SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the poi
 You: /start
 Bot: 🤖 Hello! I'm your Multi-Provider AI assistant.
      📡 Current Provider: Groq
-     🔧 Available Providers: groq, gemini, openrouter, cerebras
+     🔧 Available Providers: groq, gemini, openrouter, cerebras, nvidia
 
-You: /provider gemini
-Bot: ✅ Switched to Gemini!
-     Using default model: gemini-2.5-flash
+You: /provider nvidia
+Bot: ✅ Switched to NVIDIA!
+     Using model: openai/gpt-oss-120b
 
-You: /models
-Bot: 🤖 Available Models for Gemini:
-     • gemini-2.5-pro - Gemini 2.5 Pro (Best Quality)
-     • gemini-2.5-flash - Gemini 2.5 Flash (Balanced) ✓
-     • gemini-2.5-flash-lite - Gemini 2.5 Flash-Lite (Fastest)
+You: /models all
+Bot: 🤖 Available Models for NVIDIA:
+     • openai/gpt-oss-120b - GPT-OSS 120B (Stable Free Tier) ✓
+     • deepseek-ai/deepseek-v3.2 - DeepSeek V3.2 💭
+     • qwen/qwen3-235b-a22b - Qwen3 235B 💭
 
-You: What's the capital of France?
-Bot: The capital of France is Paris.
+You: /model deepseek-ai/deepseek-v3.2
+Bot: ✅ Switched to model: deepseek-ai/deepseek-v3.2
+
+You: /thinking on
+Bot: ✅ Thinking mode enabled! 💭
+     Model deepseek-ai/deepseek-v3.2 supports thinking.
+
+You: Explain quantum computing briefly
+Bot: 💭 **Thinking:**
+     Let me break this down into simple terms...
+     
+     Quantum computing uses quantum mechanics principles...
 ```
 
 ---
 
 ## 📊 Provider Comparison
 
-| Provider | Daily Limit | Best For | Speed |
-|----------|-------------|----------|-------|
-| **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ |
-| **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ |
-| **Gemini** | 100-1,000 | Quality responses | ⚡⚡⚡ |
-| **OpenRouter** | 50-1,000 | Model variety | ⚡⚡ |
+| Provider | Daily Limit | Best For | Speed | Special Features |
+|----------|-------------|----------|-------|------------------|
+| **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ | - |
+| **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ | - |
+| **NVIDIA** | Free tier | Thinking models | ⚡⚡⚡⚡ | 💭 Reasoning mode |
+| **Gemini** | 100-1,000 | Quality responses | ⚡⚡⚡ | - |
+| **OpenRouter** | 50-1,000 | Model variety | ⚡⚡ | - |
 
 ---
 
@@ -268,6 +300,8 @@ Built with:
 - [Groq](https://groq.com/)
 - [Google Gemini](https://ai.google.dev/)
 - [OpenRouter](https://openrouter.ai/)
+- [Cerebras](https://cerebras.ai/)
+- [NVIDIA](https://build.nvidia.com/)
 
 ---
 
