@@ -572,7 +572,9 @@ class NvidiaProvider(AIProvider):
     # Models that DON'T support thinking
     MODELS_WITHOUT_THINKING = {
         'qwen/qwen3-coder-480b-a35b-instruct',
-        'openai/gpt-oss-120b'
+        'openai/gpt-oss-120b',
+        'minimaxai/minimax-m2.1',
+        'minimaxai/minimax-m2'
     }
     
     def __init__(self, api_key: str):
@@ -649,37 +651,15 @@ class NvidiaProvider(AIProvider):
             return response.choices[0].message.content
     
     def get_available_models(self) -> List[Dict[str, str]]:
-        """Dynamically fetch available models from NVIDIA API"""
-        # Use cached models if available (refresh every bot restart)
+        """Return hand-picked NVIDIA models (NVIDIA has 183+ models, too many to list)"""
+        # Use cached models if available
         if self._cached_models:
             return self._cached_models
         
-        try:
-            # Fetch models from NVIDIA API
-            models_response = self.client.models.list()
-            
-            # Filter for chat models and sort by quality
-            chat_models = []
-            for model in models_response.data:
-                # Only include active models
-                if hasattr(model, 'id'):
-                    model_info = {
-                        "id": model.id,
-                        "name": self._format_model_name(model.id)
-                    }
-                    chat_models.append(model_info)
-            
-            # Future-proof ranking: Use capability scoring
-            chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
-            self._cached_models = chat_models
-            
-            logger.info(f"✅ NVIDIA: Detected {len(chat_models)} available models")
-            return chat_models
-            
-        except Exception as e:
-            logger.warning(f"⚠️ NVIDIA: Could not fetch models dynamically: {e}")
-            # Fallback to known models
-            return self._get_fallback_models()
+        # Return curated list of hand-picked models
+        self._cached_models = self._get_fallback_models()
+        logger.info(f"✅ NVIDIA: Using {len(self._cached_models)} hand-picked models")
+        return self._cached_models
     
     def _format_model_name(self, model_id: str) -> str:
         """Format model ID into readable name"""
@@ -704,6 +684,8 @@ class NvidiaProvider(AIProvider):
             # Free tier models (stable)
             {"id": "openai/gpt-oss-120b", "name": "GPT-OSS 120B (Stable Free Tier)"},
             {"id": "qwen/qwen3-coder-480b-a35b-instruct", "name": "Qwen3 Coder 480B (Coding)"},
+            {"id": "minimaxai/minimax-m2.1", "name": "MiniMax M2.1 (Coding Expert)"},
+            {"id": "minimaxai/minimax-m2", "name": "MiniMax M2 (LLM Expert)"},
             # Premium models with thinking (may lose access)
             {"id": "deepseek-ai/deepseek-v3.2", "name": "DeepSeek V3.2 💭"},
             {"id": "deepseek-ai/deepseek-v3.1-terminus", "name": "DeepSeek V3.1 Terminus 💭"},
