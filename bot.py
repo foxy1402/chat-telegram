@@ -116,7 +116,12 @@ class AIProvider(ABC):
     """Base class for AI providers"""
     
     @abstractmethod
-    def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
+    def chat(
+        self,
+        messages: List[Dict],
+        model: Optional[str] = None,
+        enable_thinking: bool = False
+    ) -> str:
         """Send chat messages and get response"""
         pass
     
@@ -134,6 +139,10 @@ class AIProvider(ABC):
     def get_default_model(self) -> str:
         """Get default model name"""
         pass
+
+    def supports_thinking(self, model_id: str) -> bool:
+        """Whether provider/model supports reasoning traces."""
+        return False
     
     def test_model(self, model_id: str) -> Tuple[bool, str]:
         """Test if a model actually works by sending a minimal request.
@@ -174,7 +183,12 @@ class GroqProvider(AIProvider):
         self.default_model = 'llama-3.3-70b-versatile'
         self._cached_models = None
     
-    def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
+    def chat(
+        self,
+        messages: List[Dict],
+        model: Optional[str] = None,
+        enable_thinking: bool = False
+    ) -> str:
         model = model or self.default_model
         # Inject system prompt if not already present
         chat_messages = messages.copy()
@@ -256,7 +270,12 @@ class GeminiProvider(AIProvider):
         self.default_model = "gemini-1.5-flash"
         self._cached_models = None
     
-    def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
+    def chat(
+        self,
+        messages: List[Dict],
+        model: Optional[str] = None,
+        enable_thinking: bool = False
+    ) -> str:
         if not messages:
             raise ValueError("Messages list cannot be empty")
         
@@ -369,7 +388,12 @@ class OpenRouterProvider(AIProvider):
         self.default_model = "meta-llama/llama-3.3-70b-instruct:free"
         self._cached_models = None
     
-    def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
+    def chat(
+        self,
+        messages: List[Dict],
+        model: Optional[str] = None,
+        enable_thinking: bool = False
+    ) -> str:
         model = model or self.default_model
         # Inject system prompt if not already present
         chat_messages = messages.copy()
@@ -494,7 +518,12 @@ class CerebrasProvider(AIProvider):
         self.default_model = "gpt-oss-120b"
         self._cached_models = None
     
-    def chat(self, messages: List[Dict], model: Optional[str] = None) -> str:
+    def chat(
+        self,
+        messages: List[Dict],
+        model: Optional[str] = None,
+        enable_thinking: bool = False
+    ) -> str:
         model = model or self.default_model
         # Inject system prompt if not already present
         chat_messages = messages.copy()
@@ -692,6 +721,7 @@ class NvidiaProvider(AIProvider):
             {"id": "qwen/qwen3-235b-a22b", "name": "Qwen3 235B 💭"},
             {"id": "moonshotai/kimi-k2.5", "name": "Kimi K2.5 💭"},
             {"id": "z-ai/glm4.7", "name": "GLM 4.7 💭"},
+            {"id": "z-ai/glm5", "name": "GLM 5 💭"},
         ]
     
     def get_name(self) -> str:
@@ -1358,7 +1388,7 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if current model supports thinking (only for NVIDIA)
         if provider_name == 'nvidia':
             current_model = session["models"].get(provider_name) or provider.get_default_model()
-            if hasattr(provider, 'supports_thinking') and provider.supports_thinking(current_model):
+            if provider.supports_thinking(current_model):
                 await update.message.reply_text(
                     f"✅ **Thinking mode enabled!** 💭\n\n"
                     f"Model `{current_model}` supports thinking.\n"
@@ -1447,7 +1477,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         provider = provider_manager.get_provider(provider_name)
         current_model = session["models"].get(provider_name)  # None = use provider default
         
-        # Call AI provider (pass thinking flag for NVIDIA)
+        # Call AI provider through the shared provider interface
         thinking_enabled = session.get("thinking_enabled", False)
         bot_response = provider.chat(
             messages=session["history"],
