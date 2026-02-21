@@ -639,7 +639,14 @@ def handle_command(chat_id, text, user_id):
         m = (uptime % 3600) // 60
         rssi = "N/A"
         try:
-            rssi = str(wlan.status("rssi")) + " dBm"
+            rssi_val = wlan.status("rssi")
+            if rssi_val >= -50:
+                strength = "Strong"
+            elif rssi_val >= -70:
+                strength = "Medium"
+            else:
+                strength = "Weak"
+            rssi = "%d dBm (%s)" % (rssi_val, strength)
         except Exception:
             pass
         # Fetch public IP (lightweight plain-text API)
