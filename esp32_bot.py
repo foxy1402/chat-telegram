@@ -15,7 +15,7 @@ import urequests
 import ujson
 import time
 import gc
-from machine import WDT, reset
+from machine import WDT, reset, freq
 
 # ============================================================================
 # CONFIGURATION — Edit these values before flashing
@@ -634,21 +634,44 @@ def handle_command(chat_id, text, user_id):
             rssi = str(wlan.status("rssi")) + " dBm"
         except Exception:
             pass
+        # Fetch public IP (lightweight plain-text API)
+        pub_ip = "N/A"
+        r = None
+        try:
+            r = urequests.get("http://api.ipify.org")
+            pub_ip = r.text.strip()
+            r.close()
+            r = None
+        except Exception:
+            if r:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+        gc.collect()
         free_ram = gc.mem_free()
+        used_ram = gc.mem_alloc()
+        total_ram = free_ram + used_ram
+        ram_pct = (used_ram * 100) // total_ram if total_ram else 0
+        cpu_mhz = freq() // 1000000
         tg_send(chat_id,
                 "ESP32-C3 Status\n\n"
                 "WiFi: %s\n"
                 "RSSI: %s\n"
                 "IP: %s\n"
+                "Public IP: %s\n"
                 "Uptime: %dh %dm\n"
-                "Free RAM: %d bytes\n"
+                "CPU: %d MHz\n"
+                "RAM: %d/%d bytes (%d%% used)\n"
                 "Provider: %s\n"
                 "Model: %s\n"
                 "History: %d msgs" % (
                     WIFI_SSID, rssi,
                     wlan.ifconfig()[0] if wlan.isconnected() else "disconnected",
+                    pub_ip,
                     h, m,
-                    free_ram,
+                    cpu_mhz,
+                    used_ram, total_ram, ram_pct,
                     s["provider"], s["model"],
                     len(s["history"])))
         return True
