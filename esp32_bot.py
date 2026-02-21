@@ -267,6 +267,7 @@ sessions = {}
 boot_time = 0
 tg_offset = 0
 last_duckdns = 0
+duckdns_status = "Disabled"  # Tracks DuckDNS state for /status
 wdt = None  # Watchdog timer — initialized in main()
 
 # ============================================================================
@@ -306,7 +307,7 @@ def wifi_connect():
 # ============================================================================
 
 def update_duckdns():
-    global last_duckdns
+    global last_duckdns, duckdns_status
     if not DUCKDNS_TOKEN or not DUCKDNS_DOMAIN:
         return
     now = time.time()
@@ -319,11 +320,18 @@ def update_duckdns():
     r = None
     try:
         r = urequests.get(url)
-        print("[DuckDNS]", r.text.strip())
+        result = r.text.strip()
+        print("[DuckDNS]", result)
         r.close()
         r = None
+        # DuckDNS returns "OK" on first line if successful
+        if result.startswith("OK"):
+            duckdns_status = "Running"
+        else:
+            duckdns_status = "Error: %s" % result.split("\n")[0]
     except Exception as e:
         print("[DuckDNS] Error:", e)
+        duckdns_status = "Error: %s" % str(e)
         if r:
             try:
                 r.close()
@@ -654,12 +662,14 @@ def handle_command(chat_id, text, user_id):
         total_ram = free_ram + used_ram
         ram_pct = (used_ram * 100) // total_ram if total_ram else 0
         cpu_mhz = freq() // 1000000
+        ddns = duckdns_status
         tg_send(chat_id,
                 "ESP32-C3 Status\n\n"
                 "WiFi: %s\n"
                 "RSSI: %s\n"
                 "IP: %s\n"
                 "Public IP: %s\n"
+                "DuckDNS: %s\n"
                 "Uptime: %dh %dm\n"
                 "CPU: %d MHz\n"
                 "RAM: %d/%d bytes (%d%% used)\n"
@@ -669,6 +679,7 @@ def handle_command(chat_id, text, user_id):
                     WIFI_SSID, rssi,
                     wlan.ifconfig()[0] if wlan.isconnected() else "disconnected",
                     pub_ip,
+                    ddns,
                     h, m,
                     cpu_mhz,
                     used_ram, total_ram, ram_pct,
