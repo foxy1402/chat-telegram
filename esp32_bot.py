@@ -142,6 +142,7 @@ if NVIDIA_API_KEY:
             "openai/gpt-oss-120b",
             "deepseek-ai/deepseek-v3.2",
             "deepseek-ai/deepseek-v3.1-terminus",
+            "deepseek-ai/deepseek-v3.1",
             "qwen/qwen3-235b-a22b",
             "qwen/qwen3.5-397b-a17b",
             "qwen/qwen3-coder-480b-a35b-instruct",
