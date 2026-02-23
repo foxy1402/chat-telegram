@@ -41,6 +41,12 @@ OPENROUTER_API_KEY = ""
 CEREBRAS_API_KEY = ""
 NVIDIA_API_KEY = ""
 
+# Brave Search API (set to "" to use DuckDuckGo instead — free, no key needed)
+BRAVE_API_KEY = ""
+MAX_SEARCH_RESULTS = 3  # Keep low for RAM
+MAX_SNIPPET_LEN = 200  # Truncate each snippet to save RAM
+SEARCH_ENGINE = "brave"  # "brave" or "duckduckgo" — brave needs API key, ddg is free
+
 # Bot behavior
 DEFAULT_PROVIDER = "groq"
 MAX_TOKENS = 512
@@ -49,6 +55,10 @@ MAX_HISTORY = 5  # Keep low for RAM — 5 messages ~2KB
 MAX_SESSIONS = 3  # Limit concurrent user sessions to save RAM
 MAX_RESPONSE_LEN = 4000  # Truncate AI responses beyond this to protect RAM
 SYSTEM_PROMPT = "You are a helpful AI assistant. Be concise. No markdown tables."
+SEARCH_PROMPT = (" If the user's question requires very recent or real-time information"
+                 " (news, current events, live data, today's info),"
+                 " respond ONLY with: SEARCH: <your search query>"
+                 " Do NOT search for general knowledge you already know.")
 
 # ============================================================================
 # PROVIDER DEFINITIONS
@@ -437,14 +447,15 @@ def tg_send_action(chat_id):
 # AI PROVIDER — unified OpenAI-compatible HTTP POST
 # ============================================================================
 
-def ai_chat(provider_key, model, messages):
+def ai_chat(provider_key, model, messages, sys_prompt=None):
     """Send chat to any OpenAI-compatible provider. Returns response text."""
     prov = PROVIDERS.get(provider_key)
     if not prov:
         return "Error: provider '%s' not available." % provider_key
 
     # Build messages with system prompt
-    chat_msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    prompt = sys_prompt if sys_prompt else SYSTEM_PROMPT
+    chat_msgs = [{"role": "system", "content": prompt}]
     chat_msgs.extend(messages)
 
     body = {
@@ -505,6 +516,180 @@ def ai_chat(provider_key, model, messages):
         return "Error calling %s: %s" % (prov["name"], str(e))
 
 # ============================================================================
+# WEB SEARCH — Brave API + DuckDuckGo HTML scraping
+# ============================================================================
+
+def _url_encode(s):
+    """Percent-encoding for query strings on MicroPython (UTF-8 safe)."""
+    out = []
+    for b in s.encode('utf-8'):
+        if (65 <= b <= 90) or (97 <= b <= 122) or (48 <= b <= 57) or b in (45, 46, 95, 126):
+            out.append(chr(b))  # A-Z a-z 0-9 - . _ ~
+        elif b == 32:
+            out.append('+')
+        else:
+            out.append('%%%02X' % b)
+    return ''.join(out)
+
+
+def _strip_tags(html_str):
+    """Remove HTML tags and decode common entities. Lightweight for MicroPython."""
+    # Strip tags
+    out = []
+    in_tag = False
+    for c in html_str:
+        if c == '<':
+            in_tag = True
+        elif c == '>':
+            in_tag = False
+        elif not in_tag:
+            out.append(c)
+    text = ''.join(out)
+    # Decode common HTML entities
+    text = text.replace('&amp;', '&')
+    text = text.replace('&lt;', '<')
+    text = text.replace('&gt;', '>')
+    text = text.replace('&quot;', '"')
+    text = text.replace('&#39;', "'")
+    text = text.replace('&#x27;', "'")
+    text = text.replace('&nbsp;', ' ')
+    return text.strip()
+
+
+def brave_search(query):
+    """Search the web via Brave Search API. Returns list of snippet strings."""
+    if not BRAVE_API_KEY:
+        return []
+
+    q = _url_encode(query)
+    url = "https://api.search.brave.com/res/v1/web/search?q=%s&count=%d" % (q, MAX_SEARCH_RESULTS)
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": BRAVE_API_KEY,
+    }
+    gc.collect()
+
+    r = None
+    try:
+        r = urequests.get(url, headers=headers)
+        data = r.json()
+        r.close()
+        r = None
+        gc.collect()
+
+        # Extract snippets from web results
+        web = data.get("web", {})
+        results = web.get("results", [])
+        snippets = []
+        for item in results:
+            title = item.get("title", "")
+            desc = item.get("description", "")
+            if desc and len(desc) > MAX_SNIPPET_LEN:
+                desc = desc[:MAX_SNIPPET_LEN]
+            if title or desc:
+                snippets.append("%s: %s" % (title, desc))
+
+        # Free parsed JSON immediately
+        del data
+        del web
+        del results
+        gc.collect()
+
+        print("[Search] Brave '%s' -> %d results" % (query, len(snippets)))
+        return snippets
+
+    except Exception as e:
+        print("[Search] Brave error: %s" % e)
+        if r:
+            try:
+                r.close()
+            except Exception:
+                pass
+        gc.collect()
+        return []
+
+
+def duckduckgo_search(query):
+    """Search the web via DuckDuckGo HTML scraping. Free, no API key.
+    Returns list of snippet strings (same format as brave_search)."""
+    q = _url_encode(query)
+    url = "https://html.duckduckgo.com/html/?q=%s" % q
+    headers = {"User-Agent": "Mozilla/5.0"}
+    gc.collect()
+
+    r = None
+    try:
+        r = urequests.get(url, headers=headers)
+        html = r.text
+        r.close()
+        r = None
+        gc.collect()
+
+        # Parse HTML results using str.find() — lightweight for MicroPython
+        snippets = []
+        pos = 0
+        while len(snippets) < MAX_SEARCH_RESULTS:
+            # Find next result block
+            pos = html.find('class="result__a"', pos)
+            if pos == -1:
+                break
+
+            # Extract title text: find the > after class attr, then </a>
+            tag_end = html.find('>', pos)
+            if tag_end == -1:
+                break
+            title_start = tag_end + 1
+            title_end = html.find('</a>', title_start)
+            if title_end == -1:
+                break
+            title = _strip_tags(html[title_start:title_end])
+
+            # Extract snippet: find result__snippet between this result and next
+            snip_pos = html.find('class="result__snippet', pos)
+            next_result = html.find('class="result__a"', title_end + 1)
+            desc = ""
+            if snip_pos != -1 and (next_result == -1 or snip_pos < next_result):
+                stag_end = html.find('>', snip_pos)
+                if stag_end != -1:
+                    snip_start = stag_end + 1
+                    snip_end = html.find('</a>', snip_start)
+                    if snip_end == -1:
+                        snip_end = html.find('</td>', snip_start)
+                    if snip_end != -1:
+                        desc = _strip_tags(html[snip_start:snip_end])
+                        if len(desc) > MAX_SNIPPET_LEN:
+                            desc = desc[:MAX_SNIPPET_LEN]
+
+            if title:
+                snippets.append("%s: %s" % (title, desc))
+
+            pos = title_end + 1
+
+        # Free HTML immediately — it's 30-60KB
+        del html
+        gc.collect()
+
+        print("[Search] DDG '%s' -> %d results" % (query, len(snippets)))
+        return snippets
+
+    except Exception as e:
+        print("[Search] DDG error: %s" % e)
+        if r:
+            try:
+                r.close()
+            except Exception:
+                pass
+        gc.collect()
+        return []
+
+
+def web_search(query, engine):
+    """Dispatch search to the active engine. Returns list of snippet strings."""
+    if engine == "brave" and BRAVE_API_KEY:
+        return brave_search(query)
+    return duckduckgo_search(query)
+
+# ============================================================================
 # SESSION MANAGEMENT
 # ============================================================================
 
@@ -518,10 +703,14 @@ def get_session(user_id):
             gc.collect()
         # Pick first available provider or default
         prov = DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else next(iter(PROVIDERS), "")
+        # Pick default search engine
+        eng = "brave" if (SEARCH_ENGINE == "brave" and BRAVE_API_KEY) else "duckduckgo"
         sessions[user_id] = {
             "provider": prov,
             "model": PROVIDERS[prov]["default_model"] if prov else "",
             "history": [],
+            "web_search": True,
+            "search_engine": eng,
         }
     return sessions[user_id]
 
@@ -552,16 +741,17 @@ def handle_command(chat_id, text, user_id):
         return True
 
     if cmd == "/help":
-        tg_send(chat_id,
-                "Commands:\n"
+        help_text = ("Commands:\n"
                 "/provider [name] - switch provider\n"
                 "/models - list models (auto-fetched!)\n"
                 "/model [id] - switch model\n"
                 "/refresh - re-fetch model lists from APIs\n"
                 "/clear - clear history\n"
                 "/status - device info\n"
+                "/web [on|off|brave|ddg] - web search\n"
                 "/help - this message\n\n"
                 "Just type a message to chat!")
+        tg_send(chat_id, help_text)
         return True
 
     if cmd == "/provider":
@@ -704,6 +894,41 @@ def handle_command(chat_id, text, user_id):
                     len(s["history"])))
         return True
 
+    if cmd == "/web":
+        if not arg:
+            status = "ON" if s.get("web_search") else "OFF"
+            eng = s.get("search_engine", "brave")
+            eng_label = "Brave API" if eng == "brave" else "DuckDuckGo"
+            tg_send(chat_id,
+                    "Web search: %s\nEngine: %s\n\n"
+                    "Use: /web on | /web off\n"
+                    "/web brave - switch to Brave API\n"
+                    "/web ddg - switch to DuckDuckGo (free)" % (status, eng_label))
+            return True
+        a = arg.lower()
+        if a == "on":
+            s["web_search"] = True
+            eng = s.get("search_engine", "brave")
+            eng_label = "Brave API" if eng == "brave" else "DuckDuckGo"
+            tg_send(chat_id, "Web search enabled (%s)." % eng_label)
+        elif a == "off":
+            s["web_search"] = False
+            tg_send(chat_id, "Web search disabled.")
+        elif a == "brave":
+            if not BRAVE_API_KEY:
+                tg_send(chat_id, "Brave API key not configured.\nUse /web ddg for free search.")
+            else:
+                s["search_engine"] = "brave"
+                s["web_search"] = True
+                tg_send(chat_id, "Switched to Brave Search API.")
+        elif a == "ddg" or a == "duckduckgo":
+            s["search_engine"] = "duckduckgo"
+            s["web_search"] = True
+            tg_send(chat_id, "Switched to DuckDuckGo (free, no API key).")
+        else:
+            tg_send(chat_id, "Use: /web on|off|brave|ddg")
+        return True
+
     # Unknown command
     tg_send(chat_id, "Unknown command: %s\nTry /help" % cmd)
     return True
@@ -713,7 +938,8 @@ def handle_command(chat_id, text, user_id):
 # ============================================================================
 
 def handle_message(chat_id, text, user_id):
-    """Handle regular text messages — forward to AI provider."""
+    """Handle regular text messages — forward to AI provider.
+    Includes LLM loop: if AI requests a web search, fetch results and re-query."""
     s = get_session(user_id)
 
     # Add to history (truncate very long messages to protect RAM)
@@ -728,8 +954,41 @@ def handle_message(chat_id, text, user_id):
     # Send typing indicator
     tg_send_action(chat_id)
 
-    # Call AI
-    response = ai_chat(s["provider"], s["model"], s["history"])
+    # Build system prompt — append search instructions if web search is on
+    web_on = s.get("web_search")
+    prompt = SYSTEM_PROMPT + SEARCH_PROMPT if web_on else None
+
+    # Pass 1: Call AI (with search-aware prompt if web is on)
+    response = ai_chat(s["provider"], s["model"], s["history"], prompt)
+
+    # LLM Loop: check if AI wants to search the web
+    if web_on and response.strip().upper().startswith("SEARCH:"):
+        # Extract query after "SEARCH:" (case-insensitive, strip whitespace)
+        query = response.strip()[7:].strip()
+        if query:
+            engine = s.get("search_engine", "brave")
+            print("[Bot] AI requested search (%s): '%s'" % (engine, query))
+            tg_send_action(chat_id)  # refresh typing indicator
+            snippets = web_search(query, engine)
+            if snippets:
+                # Build search context for second pass
+                ctx = "Web results for '%s':\n" % query
+                for i, snip in enumerate(snippets):
+                    ctx += "%d. %s\n" % (i + 1, snip)
+                del snippets
+                # Second pass with search context (don't pollute history)
+                search_msgs = list(s["history"])  # shallow copy
+                search_msgs.append({"role": "assistant", "content": "I'll search the web for that."})
+                search_msgs.append({"role": "user", "content": ctx + "\nUsing these search results, answer my original question concisely."})
+                tg_send_action(chat_id)
+                response = ai_chat(s["provider"], s["model"], search_msgs)
+                del search_msgs
+                del ctx
+                gc.collect()
+            else:
+                # Search failed — retry without search prompt so AI answers normally
+                del snippets
+                response = ai_chat(s["provider"], s["model"], s["history"])
 
     # Add response to history
     s["history"].append({"role": "assistant", "content": response})
