@@ -1,10 +1,13 @@
 import os
+import re
 import logging
 import json
 import asyncio
+import urllib.parse
+import html as html_module
+import requests
 from abc import ABC, abstractmethod
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -23,6 +26,17 @@ MAX_TOKENS = int(os.getenv('MAX_TOKENS', '512'))  # Configurable token limit (lo
 TEMPERATURE = float(os.getenv('TEMPERATURE', '0.7'))  # Configurable temperature (0.0-1.0)
 MAX_HISTORY_MESSAGES = int(os.getenv('MAX_HISTORY_MESSAGES', '20'))  # Configurable history length
 SYSTEM_PROMPT = os.getenv('SYSTEM_PROMPT', 'You are a helpful AI assistant. Be concise and straight to the point. Avoid unnecessary explanations unless specifically asked.')
+MAX_MESSAGE_LENGTH = 4096  # Telegram's per-message character limit
+
+# Web Search Configuration
+BRAVE_API_KEY = os.getenv('BRAVE_API_KEY', '')
+SEARCH_ENGINE = os.getenv('SEARCH_ENGINE', 'brave').lower()  # "brave" or "duckduckgo"
+MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '3'))
+MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '300'))
+SEARCH_PROMPT = (" If the user's question requires very recent or real-time information"
+                 " (news, current events, live data, today's info),"
+                 " respond ONLY with: SEARCH: <your search query>"
+                 " Do NOT search for general knowledge you already know.")
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
@@ -37,8 +51,6 @@ VALIDATED_MODELS_CACHE = os.path.join(os.path.dirname(__file__), 'validated_mode
 # ============================================================================
 # FUTURE-PROOF MODEL RANKING UTILITIES
 # ============================================================================
-
-import re
 
 def extract_parameter_size(model_id: str) -> int:
     """
@@ -280,15 +292,17 @@ class GeminiProvider(AIProvider):
             raise ValueError("Messages list cannot be empty")
         
         model_name = model or self.default_model
+        # Extract system prompt from messages (supports dynamic prompts like SEARCH_PROMPT)
+        system_msg = next((m["content"] for m in messages if m["role"] == "system"), SYSTEM_PROMPT)
         # Configure model with system prompt and generation settings
         generation_config = {
             "temperature": TEMPERATURE,
             "max_output_tokens": MAX_TOKENS,
         }
-        model = self.genai.GenerativeModel(
+        gen_model = self.genai.GenerativeModel(
             model_name,
             generation_config=generation_config,
-            system_instruction=SYSTEM_PROMPT
+            system_instruction=system_msg
         )
         
         # Convert messages to Gemini format (skip system messages as they're in system_instruction)
@@ -300,7 +314,7 @@ class GeminiProvider(AIProvider):
             chat_history.append({"role": role, "parts": [msg["content"]]})
         
         # Start chat with history
-        chat = model.start_chat(history=chat_history)
+        chat = gen_model.start_chat(history=chat_history)
         
         # Send last message
         response = chat.send_message(messages[-1]["content"])
@@ -377,13 +391,12 @@ class OpenRouterProvider(AIProvider):
     
     def __init__(self, api_key: str):
         from openai import OpenAI
-        import requests
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key
         )
         self.api_key = api_key
-        self.requests = requests
+        self.requests = requests  # module-level import
         # Smart default: Use the smartest free model (no auto-select)
         self.default_model = "meta-llama/llama-3.3-70b-instruct:free"
         self._cached_models = None
@@ -822,11 +835,14 @@ user_sessions: Dict[str, Dict] = {}
 def get_user_session(user_id: str) -> Dict:
     """Get or create user session"""
     if user_id not in user_sessions:
+        default_engine = "brave" if (SEARCH_ENGINE == "brave" and BRAVE_API_KEY) else "duckduckgo"
         user_sessions[user_id] = {
             "provider": provider_manager.get_default_provider(),
             "models": {},  # Store model per provider: {"groq": "model-id", "gemini": "model-id"}
             "history": [],
-            "thinking_enabled": False  # For NVIDIA thinking models
+            "thinking_enabled": False,  # For NVIDIA thinking models
+            "web_search": True,         # Web search enabled by default
+            "search_engine": default_engine,  # "brave" or "duckduckgo"
         }
     return user_sessions[user_id]
 
@@ -921,6 +937,123 @@ def clear_validated_models(provider_name: Optional[str] = None):
 
 
 # ============================================================================
+# WEB SEARCH — Brave API + DuckDuckGo HTML scraping
+# ============================================================================
+
+
+def _strip_tags(html_str: str) -> str:
+    """Remove HTML tags and decode common entities."""
+    out = []
+    in_tag = False
+    for c in html_str:
+        if c == '<':
+            in_tag = True
+        elif c == '>':
+            in_tag = False
+        elif not in_tag:
+            out.append(c)
+    text = ''.join(out)
+    text = html_module.unescape(text)
+    return text.strip()
+
+def _brave_search_sync(query: str) -> list:
+    """Search the web via Brave Search API (synchronous). Returns list of snippet strings."""
+    if not BRAVE_API_KEY:
+        return []
+
+    q = urllib.parse.quote_plus(query)
+    url = f"https://api.search.brave.com/res/v1/web/search?q={q}&count={MAX_SEARCH_RESULTS}"
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": BRAVE_API_KEY,
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        web = data.get("web", {})
+        results = web.get("results", [])
+        snippets = []
+        for item in results:
+            title = item.get("title", "")
+            desc = item.get("description", "")
+            if desc and len(desc) > MAX_SNIPPET_LEN:
+                desc = desc[:MAX_SNIPPET_LEN]
+            if title or desc:
+                snippets.append(f"{title}: {desc}")
+
+        logger.info(f"[Search] Brave '{query}' -> {len(snippets)} results")
+        return snippets
+
+    except Exception as e:
+        logger.error(f"[Search] Brave error: {e}")
+        return []
+
+def _duckduckgo_search_sync(query: str) -> list:
+    """Search the web via DuckDuckGo HTML scraping (synchronous). Free, no API key."""
+    q = urllib.parse.quote_plus(query)
+    url = f"https://html.duckduckgo.com/html/?q={q}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        html_text = r.text
+
+        # Parse HTML results using str.find() — same lightweight approach as ESP32 version
+        snippets = []
+        pos = 0
+        while len(snippets) < MAX_SEARCH_RESULTS:
+            pos = html_text.find('class="result__a"', pos)
+            if pos == -1:
+                break
+
+            tag_end = html_text.find('>', pos)
+            if tag_end == -1:
+                break
+            title_start = tag_end + 1
+            title_end = html_text.find('</a>', title_start)
+            if title_end == -1:
+                break
+            title = _strip_tags(html_text[title_start:title_end])
+
+            snip_pos = html_text.find('class="result__snippet', pos)
+            next_result = html_text.find('class="result__a"', title_end + 1)
+            desc = ""
+            if snip_pos != -1 and (next_result == -1 or snip_pos < next_result):
+                stag_end = html_text.find('>', snip_pos)
+                if stag_end != -1:
+                    snip_start = stag_end + 1
+                    snip_end = html_text.find('</a>', snip_start)
+                    if snip_end == -1:
+                        snip_end = html_text.find('</td>', snip_start)
+                    if snip_end != -1:
+                        desc = _strip_tags(html_text[snip_start:snip_end])
+                        if len(desc) > MAX_SNIPPET_LEN:
+                            desc = desc[:MAX_SNIPPET_LEN]
+
+            if title:
+                snippets.append(f"{title}: {desc}")
+
+            pos = title_end + 1
+
+        logger.info(f"[Search] DDG '{query}' -> {len(snippets)} results")
+        return snippets
+
+    except Exception as e:
+        logger.error(f"[Search] DDG error: {e}")
+        return []
+
+async def web_search(query: str, engine: str) -> list:
+    """Dispatch search to the active engine (async wrapper). Returns list of snippet strings."""
+    if engine == "brave" and BRAVE_API_KEY:
+        return await asyncio.to_thread(_brave_search_sync, query)
+    return await asyncio.to_thread(_duckduckgo_search_sync, query)
+
+
+# ============================================================================
 # COMMAND HANDLERS
 # ============================================================================
 
@@ -935,17 +1068,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     session = get_user_session(user_id)
     provider = provider_manager.get_provider(session["provider"])
+    if not provider:
+        session["provider"] = provider_manager.get_default_provider()
+        provider = provider_manager.get_provider(session["provider"])
     available_providers = ", ".join(provider_manager.list_providers())
     
+    web_status = "ON" if session.get("web_search") else "OFF"
     await update.message.reply_text(
         f"🤖 Hello! I'm your Multi-Provider AI assistant.\n\n"
         f"📡 Current Provider: **{provider.get_name()}**\n"
-        f"🔧 Available Providers: {available_providers}\n\n"
+        f"🔧 Available Providers: {available_providers}\n"
+        f"🌐 Web Search: {web_status}\n\n"
         f"Just send me a message and I'll respond!\n\n"
         f"**Commands:**\n"
         f"/provider - Switch AI provider\n"
         f"/models - List available models (auto-detected!)\n"
         f"/model - Switch model\n"
+        f"/web - Toggle web search (on/off/brave/ddg)\n"
         f"/refresh - Refresh model lists from APIs\n"
         f"/clear - Clear conversation history\n"
         f"/help - Show help",
@@ -997,7 +1136,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/models all` - List all available models from API\n"
         "• `/model <name>` - Switch to a specific model\n"
         "• `/refresh` - Refresh model lists from providers\n\n"
-        "**Model Validation (NEW!):**\n"
+        "**Web Search:**\n"
+        "• `/web` - Show web search status\n"
+        "• `/web on` / `/web off` - Toggle web search\n"
+        "• `/web brave` - Switch to Brave Search API\n"
+        "• `/web ddg` - Switch to DuckDuckGo (free)\n\n"
+        "**Model Validation:**\n"
         "• `/validate` - Test all models to see which actually work\n"
         "• `/verified` - Show only validated working models\n"
         "• `/clearvalidation` - Clear validation cache\n\n"
@@ -1010,6 +1154,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Features:**\n"
         "✨ Auto-detects new models from providers\n"
         "✨ Validates models with real API tests\n"
+        "✨ Web search with Brave API or DuckDuckGo\n"
         "✨ Shows only working models by default!",
         parse_mode='Markdown'
     )
@@ -1027,6 +1172,9 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # If no argument, show current provider and available options
     if not context.args:
         current_provider = provider_manager.get_provider(session["provider"])
+        if not current_provider:
+            session["provider"] = provider_manager.get_default_provider()
+            current_provider = provider_manager.get_provider(session["provider"])
         available = ", ".join(provider_manager.list_providers())
         await update.message.reply_text(
             f"📡 **Current Provider:** {current_provider.get_name()}\n"
@@ -1067,8 +1215,12 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     session = get_user_session(user_id)
-    provider = provider_manager.get_provider(session["provider"])
     provider_name = session["provider"]
+    provider = provider_manager.get_provider(provider_name)
+    if not provider:
+        session["provider"] = provider_manager.get_default_provider()
+        provider_name = session["provider"]
+        provider = provider_manager.get_provider(provider_name)
     
     # Check if user wants to see all models
     show_all = len(context.args) > 0 and context.args[0].lower() == 'all'
@@ -1141,6 +1293,10 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_user_session(user_id)
     provider_name = session["provider"]
     provider = provider_manager.get_provider(provider_name)
+    if not provider:
+        session["provider"] = provider_manager.get_default_provider()
+        provider_name = session["provider"]
+        provider = provider_manager.get_provider(provider_name)
     
     # If no argument, show current model
     if not context.args:
@@ -1182,11 +1338,12 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     session = get_user_session(user_id)
-    provider = provider_manager.get_provider(session["provider"])
     provider_name = session["provider"]
-    
-    # Check if user wants to retry only failed models
-    retry_only = len(context.args) > 0 and context.args[0].lower() == 'retry'
+    provider = provider_manager.get_provider(provider_name)
+    if not provider:
+        session["provider"] = provider_manager.get_default_provider()
+        provider_name = session["provider"]
+        provider = provider_manager.get_provider(provider_name)
     
     # Get all available models
     models = provider.get_available_models()
@@ -1202,17 +1359,7 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skipped_failed = len(permanently_failed)
     
     # Show smart validation message
-    if retry_only:
-        await update.message.reply_text(
-            f"🔄 **Retry Mode**\n\n"
-            f"• Total: {total}\n"
-            f"• Already validated: {skipped_validated}\n"
-            f"• Permanently failed: {skipped_failed}\n"
-            f"• To test: {len(models_to_test)}\n\n"
-            f"⏳ ~{len(models_to_test) * 2}s (2s delay per model)",
-            parse_mode='Markdown'
-        )
-    elif (skipped_validated + skipped_failed) > 0:
+    if (skipped_validated + skipped_failed) > 0:
         await update.message.reply_text(
             f"💡 **Smart Validation**\n\n"
             f"Skipping {skipped_validated + skipped_failed} models:\n"
@@ -1321,8 +1468,12 @@ async def verified_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     session = get_user_session(user_id)
-    provider = provider_manager.get_provider(session["provider"])
     provider_name = session["provider"]
+    provider = provider_manager.get_provider(provider_name)
+    if not provider:
+        session["provider"] = provider_manager.get_default_provider()
+        provider_name = session["provider"]
+        provider = provider_manager.get_provider(provider_name)
     
     # Get validated models
     validated_ids = get_validated_models(provider_name)
@@ -1368,6 +1519,10 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_user_session(user_id)
     provider_name = session["provider"]
     provider = provider_manager.get_provider(provider_name)
+    if not provider:
+        session["provider"] = provider_manager.get_default_provider()
+        provider_name = session["provider"]
+        provider = provider_manager.get_provider(provider_name)
     
     # Check if no argument provided
     if not context.args:
@@ -1437,6 +1592,10 @@ async def clearvalidation_command(update: Update, context: ContextTypes.DEFAULT_
     session = get_user_session(user_id)
     provider_name = session["provider"]
     provider = provider_manager.get_provider(provider_name)
+    if not provider:
+        session["provider"] = provider_manager.get_default_provider()
+        provider_name = session["provider"]
+        provider = provider_manager.get_provider(provider_name)
     
     clear_validated_models(provider_name)
     
@@ -1445,6 +1604,62 @@ async def clearvalidation_command(update: Update, context: ContextTypes.DEFAULT_
         f"Run `/validate` to re-test models.",
         parse_mode='Markdown'
     )
+
+async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle web search settings."""
+    user_id = str(update.effective_user.id)
+    
+    if not is_user_allowed(user_id):
+        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        return
+    
+    session = get_user_session(user_id)
+    
+    if not context.args:
+        status = "ON" if session.get("web_search") else "OFF"
+        eng = session.get("search_engine", "brave")
+        eng_label = "Brave API" if eng == "brave" else "DuckDuckGo"
+        await update.message.reply_text(
+            f"🌐 **Web Search:** {status}\n"
+            f"🔍 **Engine:** {eng_label}\n\n"
+            f"Use: `/web on` | `/web off`\n"
+            f"`/web brave` - switch to Brave API\n"
+            f"`/web ddg` - switch to DuckDuckGo (free)",
+            parse_mode='Markdown'
+        )
+        return
+    
+    arg = context.args[0].lower()
+    
+    if arg == "on":
+        session["web_search"] = True
+        eng = session.get("search_engine", "brave")
+        eng_label = "Brave API" if eng == "brave" else "DuckDuckGo"
+        await update.message.reply_text(f"✅ Web search enabled ({eng_label}).")
+    elif arg == "off":
+        session["web_search"] = False
+        await update.message.reply_text("🔕 Web search disabled.")
+    elif arg == "brave":
+        if not BRAVE_API_KEY:
+            await update.message.reply_text(
+                "❌ Brave API key not configured.\n"
+                "Use `/web ddg` for free search.",
+                parse_mode='Markdown'
+            )
+        else:
+            session["search_engine"] = "brave"
+            session["web_search"] = True
+            await update.message.reply_text("✅ Switched to Brave Search API.")
+    elif arg in ("ddg", "duckduckgo"):
+        session["search_engine"] = "duckduckgo"
+        session["web_search"] = True
+        await update.message.reply_text("✅ Switched to DuckDuckGo (free, no API key).")
+    else:
+        await update.message.reply_text(
+            "❌ Use: `/web on|off|brave|ddg`",
+            parse_mode='Markdown'
+        )
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages."""
@@ -1456,17 +1671,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user_message = update.message.text
+    if not user_message:
+        return  # guard against None/empty text
+    
     session = get_user_session(user_id)
-    
-    # Add user message to history
-    session["history"].append({
-        "role": "user",
-        "content": user_message
-    })
-    
-    # Keep only last N messages to avoid token limits (configurable)
-    if len(session["history"]) > MAX_HISTORY_MESSAGES:
-        session["history"] = session["history"][-MAX_HISTORY_MESSAGES:]
     
     try:
         # Send typing indicator
@@ -1475,15 +1683,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Get current provider and model
         provider_name = session["provider"]
         provider = provider_manager.get_provider(provider_name)
+        if not provider:
+            session["provider"] = provider_manager.get_default_provider()
+            provider_name = session["provider"]
+            provider = provider_manager.get_provider(provider_name)
         current_model = session["models"].get(provider_name)  # None = use provider default
         
-        # Call AI provider through the shared provider interface
+        # Add user message to history (inside try so we can pop on failure)
+        session["history"].append({
+            "role": "user",
+            "content": user_message
+        })
         thinking_enabled = session.get("thinking_enabled", False)
+        
+        # Build messages for Pass 1 — append search prompt if web search is enabled
+        web_on = session.get("web_search", True)
+        pass1_messages = session["history"].copy()
+        if web_on:
+            # Inject search-aware system prompt
+            if pass1_messages and pass1_messages[0].get("role") == "system":
+                pass1_messages[0] = {
+                    "role": "system",
+                    "content": pass1_messages[0]["content"] + SEARCH_PROMPT
+                }
+            else:
+                pass1_messages.insert(0, {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT + SEARCH_PROMPT
+                })
+        
+        # Pass 1: Call AI (with search-aware prompt if web is on)
         bot_response = provider.chat(
-            messages=session["history"],
+            messages=pass1_messages,
             model=current_model,
             enable_thinking=thinking_enabled
-        )
+        ) or ""
+        
+        # LLM Loop: check if AI wants to search the web
+        if web_on and bot_response.strip().upper().startswith("SEARCH:"):
+            query = bot_response.strip()[7:].strip()
+            if query:
+                engine = session.get("search_engine", "brave")
+                logger.info(f"[Bot] AI requested search ({engine}): '{query}'")
+                await update.message.chat.send_action(action="typing")
+                snippets = await web_search(query, engine)
+                if snippets:
+                    # Build search context for second pass
+                    ctx = f"Web results for '{query}':\n"
+                    for i, snip in enumerate(snippets):
+                        ctx += f"{i + 1}. {snip}\n"
+                    # Pass 2: Re-query with search results (don't pollute history)
+                    search_msgs = session["history"].copy()
+                    search_msgs.append({"role": "assistant", "content": "I'll search the web for that."})
+                    search_msgs.append({"role": "user", "content": ctx + "\nUsing these search results, answer my original question concisely."})
+                    await update.message.chat.send_action(action="typing")
+                    bot_response = provider.chat(
+                        messages=search_msgs,
+                        model=current_model,
+                        enable_thinking=thinking_enabled
+                    ) or ""
+                else:
+                    # Search failed — retry without search prompt
+                    logger.warning(f"[Bot] Search returned no results, falling back")
+                    bot_response = provider.chat(
+                        messages=session["history"],
+                        model=current_model,
+                        enable_thinking=thinking_enabled
+                    ) or ""
+        
+        # Guard against empty response (Telegram rejects empty text)
+        if not bot_response.strip():
+            bot_response = "⚠️ The AI returned an empty response. Try again or switch models."
         
         # Add bot response to history
         session["history"].append({
@@ -1491,18 +1761,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "content": bot_response
         })
         
-        # Send response (split if too long for Telegram's 4096 char limit)
-        MAX_MESSAGE_LENGTH = 4096
+        # Trim history if needed
+        if len(session["history"]) > MAX_HISTORY_MESSAGES:
+            session["history"] = session["history"][-MAX_HISTORY_MESSAGES:]
+        
+        # Send response (handle Telegram's 4096 char limit)
         if len(bot_response) <= MAX_MESSAGE_LENGTH:
             await update.message.reply_text(bot_response)
         else:
+            # Reserve space for part header (e.g. "📄 Part 99/99\n\n")
+            HEADER_RESERVE = 25
+            chunk_limit = MAX_MESSAGE_LENGTH - HEADER_RESERVE
+            
             # Split message into chunks at newlines to preserve formatting
             chunks = []
             current_chunk = ""
             
             for line in bot_response.split('\n'):
-                # If adding this line would exceed limit, save current chunk and start new one
-                if len(current_chunk) + len(line) + 1 > MAX_MESSAGE_LENGTH:
+                # Force-split oversized single lines (e.g. base64 blobs)
+                if len(line) > chunk_limit:
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                        current_chunk = ""
+                    for j in range(0, len(line), chunk_limit):
+                        chunks.append(line[j:j + chunk_limit])
+                    continue
+                if len(current_chunk) + len(line) + 1 > chunk_limit:
                     if current_chunk:
                         chunks.append(current_chunk)
                     current_chunk = line
@@ -1512,24 +1796,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         current_chunk = line
             
-            # Add remaining chunk
             if current_chunk:
                 chunks.append(current_chunk)
             
-            # Send all chunks
             for i, chunk in enumerate(chunks, 1):
                 if len(chunks) > 1:
-                    # Add part indicator for multi-part messages
                     header = f"📄 Part {i}/{len(chunks)}\n\n"
                     await update.message.reply_text(header + chunk)
                 else:
                     await update.message.reply_text(chunk)
         
     except Exception as e:
-        logger.error(f"Error: {e}")
-        provider_name = provider_manager.get_provider(session["provider"]).get_name()
+        logger.error(f"Error in handle_message: {e}", exc_info=True)
+        # Pop orphaned user message if it was appended
+        if session["history"] and session["history"][-1].get("role") == "user":
+            session["history"].pop()
+        prov = provider_manager.get_provider(session.get("provider", ""))
+        prov_label = prov.get_name() if prov else session.get("provider", "unknown")
         await update.message.reply_text(
-            f"❌ Error with {provider_name}: {str(e)}\n\n"
+            f"❌ Error with {prov_label}: {str(e)}\n\n"
             f"Try:\n"
             f"• `/clear` to reset conversation\n"
             f"• `/provider` to switch to another provider"
@@ -1563,6 +1848,7 @@ def main():
     application.add_handler(CommandHandler("verified", verified_command))
     application.add_handler(CommandHandler("clearvalidation", clearvalidation_command))
     application.add_handler(CommandHandler("thinking", thinking_command))
+    application.add_handler(CommandHandler("web", web_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Start the bot

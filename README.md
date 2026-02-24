@@ -1,6 +1,6 @@
 # 🤖 Multi-Provider AI Telegram Bot
 
-> **A universal free AI model hub for Telegram** - Switch between Groq, Gemini, OpenRouter, Cerebras, and NVIDIA with simple commands!
+> **A universal free AI model hub for Telegram** — Switch between Groq, Gemini, OpenRouter, Cerebras, and NVIDIA with simple commands. Built-in web search, model validation, and thinking mode!
 
 [![Docker Hub](https://img.shields.io/badge/docker-snoopylikefree5%2Fmulti--ai--bot-blue?logo=docker)](https://hub.docker.com/r/snoopylikefree5/multi-ai-bot)
 
@@ -8,13 +8,15 @@
 
 ## ✨ Features
 
-- 🔄 **Multiple AI Providers**: Groq, Google Gemini, OpenRouter, Cerebras, NVIDIA
-- 💭 **Thinking Mode**: See AI reasoning process with NVIDIA models (NEW!)
-- ⚡ **Easy Switching**: Change providers and models with simple commands
-- 🔒 **User Whitelisting**: Restrict access to specific users
-- 💬 **Conversation History**: Maintains context across messages
-- 🆓 **100% Free**: Uses only free tier APIs (no credit card required)
-- 🐳 **Docker Ready**: Pre-built image available on Docker Hub
+- 🔄 **5 AI Providers** — Groq, Gemini, OpenRouter, Cerebras, NVIDIA
+- 🌐 **Web Search** — AI can search the web for real-time info (Brave API or DuckDuckGo)
+- 💭 **Thinking Mode** — See AI reasoning traces with NVIDIA models
+- ✅ **Model Validation** — Test which models actually work before using them
+- ⚡ **Easy Switching** — Change providers and models with simple commands
+- 🔒 **User Whitelisting** — Restrict access to specific Telegram users
+- 💬 **Conversation History** — Context maintained across messages
+- 🆓 **100% Free** — Uses only free-tier APIs (no credit card required)
+- 🐳 **Docker Ready** — Pre-built image on Docker Hub
 
 ---
 
@@ -22,50 +24,40 @@
 
 ### 1. Get Your API Keys
 
-You'll need at least **one** of these (all are free):
+You need at least **one** provider key (all are free):
 
 | Provider | Get API Key | Free Tier |
 |----------|-------------|-----------|
 | **Groq** | [console.groq.com](https://console.groq.com) | 14,400 requests/day |
-| **Gemini** | [aistudio.google.com](https://aistudio.google.com) | 100-1,000 requests/day |
-| **OpenRouter** | [openrouter.ai](https://openrouter.ai) | 50-1,000 requests/day |
-| **Cerebras** | [cerebras.ai](https://cerebras.ai) | Free tier with fast inference |
-| **NVIDIA** | [build.nvidia.com](https://build.nvidia.com) | Free tier with thinking models 💭 |
+| **Gemini** | [aistudio.google.com](https://aistudio.google.com) | 100–1,000 requests/day |
+| **OpenRouter** | [openrouter.ai](https://openrouter.ai) | 50–1,000 requests/day |
+| **Cerebras** | [cerebras.ai](https://cerebras.ai) | Free tier, fast inference |
+| **NVIDIA** | [build.nvidia.com](https://build.nvidia.com) | Free tier, thinking models 💭 |
 
 ### 2. Get Telegram Bot Token
 
-1. Open Telegram and search for `@BotFather`
-2. Send `/newbot` and follow the prompts
+1. Open Telegram → search `@BotFather`
+2. Send `/newbot` and follow prompts
 3. Copy your bot token
 
 ### 3. Get Your Telegram User ID (Optional)
 
-To restrict bot access to only you:
-1. Search for `@userinfobot` on Telegram
-2. Start a chat - it will show your user ID
-3. Copy the ID (e.g., `123456789`)
+To restrict access to only you:
+1. Search `@userinfobot` on Telegram
+2. It will show your numeric user ID (e.g., `123456789`)
 
 ---
 
 ## 📦 Deployment
 
-### Option 1: Docker Hub (Recommended - Pre-built Image)
-
-The bot is already available on Docker Hub! Just pull and run:
+### Option 1: Docker Hub (Recommended)
 
 ```bash
-# Pull the latest image
-docker pull snoopylikefree5/multi-ai-bot:latest
-
-# Run with environment variables
+# Pull and run
 docker run -d \
-  -e TELEGRAM_TOKEN=your_telegram_bot_token \
-  -e GROQ_API_KEY=your_groq_api_key \
-  -e GEMINI_API_KEY=your_gemini_api_key \
-  -e OPENROUTER_API_KEY=your_openrouter_api_key \
-  -e CEREBRAS_API_KEY=your_cerebras_api_key \
-  -e NVIDIA_API_KEY=your_nvidia_api_key \
-  -e ALLOWED_USER_IDS=your_telegram_user_id \
+  -e TELEGRAM_TOKEN=your_token \
+  -e GROQ_API_KEY=your_key \
+  -e ALLOWED_USER_IDS=your_id \
   --name multi-ai-bot \
   snoopylikefree5/multi-ai-bot:latest
 
@@ -73,39 +65,37 @@ docker run -d \
 docker run -d --env-file .env --name multi-ai-bot snoopylikefree5/multi-ai-bot:latest
 ```
 
-**Check logs:**
 ```bash
+# Check logs
 docker logs -f multi-ai-bot
-```
 
-**Stop/restart:**
-```bash
+# Stop / restart
 docker stop multi-ai-bot
 docker start multi-ai-bot
 ```
 
-### Option 2: Claw Cloud / Cloud Platforms
-
-Deploy on [Claw Cloud](https://claw.cloud) or any container platform:
+### Option 2: Cloud Platforms (Claw Cloud, etc.)
 
 1. **Image**: `snoopylikefree5/multi-ai-bot:latest`
-2. **Environment Variables**: Set your API keys (see below)
-3. **Deploy**: Platform will automatically pull and run
+2. **Environment Variables**: Set your API keys
+3. **Deploy**: Platform pulls and runs automatically
 
 ### Option 3: Build Locally
 
 ```bash
-# 1. Clone the repository
 git clone <your-repo-url>
 cd chat-telegram
-
-# 2. Create .env file
-cp .env.example .env
-# Edit .env with your actual keys
-
-# 3. Build and run
+cp .env.example .env   # Edit with your keys
 docker build -t multi-ai-bot .
 docker run -d --env-file .env --name multi-ai-bot multi-ai-bot
+```
+
+### Option 4: Run Without Docker
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # Edit with your keys
+python bot.py
 ```
 
 ---
@@ -128,98 +118,169 @@ CEREBRAS_API_KEY=your_cerebras_api_key
 NVIDIA_API_KEY=your_nvidia_api_key
 ```
 
-### Optional
+### Access Control
 
 ```env
-# Restrict access to specific users (comma-separated)
+# Comma-separated Telegram user IDs. Leave empty to allow anyone.
 ALLOWED_USER_IDS=123456789,987654321
+```
 
-# Default provider (groq, gemini, openrouter, cerebras, or nvidia)
+### Bot Behavior
+
+```env
+# Default provider: groq, gemini, openrouter, cerebras, or nvidia
 DEFAULT_PROVIDER=groq
 
-# Response Configuration (Control response length and style)
-# Maximum tokens per response (lower = shorter responses, less TPM usage)
-# Recommended: 512 (concise), 1024 (balanced), 2048 (detailed)
+# Max tokens per response (512 = concise, 1024 = balanced, 2048 = detailed)
 MAX_TOKENS=512
 
-# Temperature (0.0-1.0): 0.7 balanced, 0.3 focused, 0.9 creative
+# Temperature (0.0 = deterministic, 0.7 = balanced, 1.0 = creative)
 TEMPERATURE=0.7
 
-# Maximum conversation history messages
+# Max messages kept in conversation history
 MAX_HISTORY_MESSAGES=20
 
-# System prompt to guide AI behavior
-# Instructs AI to be concise and use Telegram-friendly formatting (no tables)
-SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the point. Avoid unnecessary explanations unless specifically asked. IMPORTANT: Never use markdown tables (|---|---| format) as they are unreadable in Telegram. Instead, use bullet points, numbered lists, or simple line-by-line formatting.
+# System prompt (customize AI personality)
+SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the point.
+```
+
+### Web Search
+
+```env
+# Brave Search API key (free: https://brave.com/search/api/)
+# If not set, DuckDuckGo is used (free, no key needed)
+BRAVE_API_KEY=your_brave_api_key
+
+# Engine: "brave" or "duckduckgo" (default: brave)
+SEARCH_ENGINE=brave
+
+# Number of results to fetch (default: 3)
+MAX_SEARCH_RESULTS=3
+
+# Max snippet length per result (default: 300)
+MAX_SNIPPET_LEN=300
 ```
 
 ---
 
 ## 💬 Bot Commands
 
-### Provider Management
+### Provider & Model Management
 
-- `/provider` - Show current provider and available options
-- `/provider <name>` - Switch to a different provider
-  - Example: `/provider gemini`, `/provider cerebras`, or `/provider nvidia`
-- `/models` - List verified working models for current provider
-- `/models all` - List all available models from API
-- `/model <name>` - Switch to a specific model
-  - Example: `/model gemini-2.5-pro`
+| Command | Description |
+|---------|-------------|
+| `/provider` | Show current provider and available options |
+| `/provider <name>` | Switch provider (`groq`, `gemini`, `openrouter`, `cerebras`, `nvidia`) |
+| `/models` | List verified working models for current provider |
+| `/models all` | List all available models from API |
+| `/model <id>` | Switch to a specific model |
+| `/refresh` | Re-fetch model lists from all provider APIs |
 
-### Thinking Mode (NVIDIA Only) 💭
+### Web Search 🌐
 
-- `/thinking on` - Enable thinking/reasoning mode (shows AI's thought process)
-- `/thinking off` - Disable thinking mode (more concise responses)
-- `/thinking` - Check current thinking mode status
+| Command | Description |
+|---------|-------------|
+| `/web` | Show current web search status and engine |
+| `/web on` | Enable web search |
+| `/web off` | Disable web search |
+| `/web brave` | Switch to Brave Search API |
+| `/web ddg` | Switch to DuckDuckGo (free, no key) |
 
-**Note:** Only NVIDIA provider supports thinking mode. Models with 💭 icon support this feature.
+When web search is enabled, the AI automatically detects when your question needs real-time info (news, current events, live data) and searches the web. Works with any provider.
 
-### Model Validation
+### Model Validation ✅
 
-- `/validate` - Test all models to see which actually work
-- `/verified` - Show only validated working models
-- `/clearvalidation` - Clear validation cache and re-test
+| Command | Description |
+|---------|-------------|
+| `/validate` | Test all models with real API calls to find working ones |
+| `/verified` | Show only validated working models |
+| `/clearvalidation` | Clear cache and re-test all models |
 
-### Other Commands
+Validation results are cached to disk (`validated_models.json`) and persist across restarts. Smart validation skips already-tested models.
 
-- `/start` - Show welcome message
-- `/clear` - Clear conversation history
-- `/refresh` - Refresh model lists from providers
-- `/help` - Show help message
+### Thinking Mode 💭 (NVIDIA Only)
+
+| Command | Description |
+|---------|-------------|
+| `/thinking` | Check current thinking mode status |
+| `/thinking on` | Enable — see AI reasoning in responses |
+| `/thinking off` | Disable — get concise responses |
+
+Only NVIDIA models with a 💭 icon support thinking. The bot will warn you if your current model doesn't support it.
+
+### General
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Welcome message with status overview |
+| `/clear` | Clear conversation history |
+| `/help` | Full command reference |
 
 ---
 
 ## 🎯 Usage Examples
 
+### Basic Chat
 ```
-You: /start
-Bot: 🤖 Hello! I'm your Multi-Provider AI assistant.
-     📡 Current Provider: Groq
-     🔧 Available Providers: groq, gemini, openrouter, cerebras, nvidia
+You: Hello, what's the capital of France?
+Bot: Paris.
+```
 
+### Switch Provider & Model
+```
 You: /provider nvidia
 Bot: ✅ Switched to NVIDIA!
      Using model: openai/gpt-oss-120b
 
 You: /models all
-Bot: 🤖 Available Models for NVIDIA:
+Bot: 🤖 NVIDIA (All Models):
      • openai/gpt-oss-120b - GPT-OSS 120B (Stable Free Tier) ✓
      • deepseek-ai/deepseek-v3.2 - DeepSeek V3.2 💭
      • qwen/qwen3-235b-a22b - Qwen3 235B 💭
+     ...
 
 You: /model deepseek-ai/deepseek-v3.2
 Bot: ✅ Switched to model: deepseek-ai/deepseek-v3.2
+```
 
+### Thinking Mode
+```
 You: /thinking on
 Bot: ✅ Thinking mode enabled! 💭
-     Model deepseek-ai/deepseek-v3.2 supports thinking.
 
-You: Explain quantum computing briefly
+You: Explain quantum computing
 Bot: 💭 **Thinking:**
-     Let me break this down into simple terms...
-     
-     Quantum computing uses quantum mechanics principles...
+     Let me break this down...
+
+     Quantum computing uses qubits instead of classical bits...
+```
+
+### Web Search
+```
+You: /web on
+Bot: ✅ Web search enabled (Brave API).
+
+You: What happened in tech news today?
+Bot: (AI detects this needs real-time info, searches the web, then answers)
+     Based on today's news: ...
+```
+
+### Model Validation
+```
+You: /validate
+Bot: 🔍 Full Validation — Testing all 10 models
+     ⏳ ~20s (2s delay to avoid rate limits)
+     ...
+     ✅ Validation Complete
+     • Tested: 10
+     • ✅ Newly validated: 7
+     • ❌ Failed: 3
+
+You: /verified
+Bot: ✅ Verified Models for NVIDIA:
+     • openai/gpt-oss-120b ✓
+     • deepseek-ai/deepseek-v3.2
+     ...
 ```
 
 ---
@@ -228,68 +289,78 @@ Bot: 💭 **Thinking:**
 
 | Provider | Daily Limit | Best For | Speed | Special Features |
 |----------|-------------|----------|-------|------------------|
-| **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ | - |
-| **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ | - |
+| **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ | — |
+| **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ | — |
 | **NVIDIA** | Free tier | Thinking models | ⚡⚡⚡⚡ | 💭 Reasoning mode |
-| **Gemini** | 100-1,000 | Quality responses | ⚡⚡⚡ | - |
-| **OpenRouter** | 50-1,000 | Model variety | ⚡⚡ | - |
+| **Gemini** | 100–1,000 | Quality responses | ⚡⚡⚡ | — |
+| **OpenRouter** | 50–1,000 | Model variety | ⚡⚡ | — |
+
+---
+
+## 🌐 How Web Search Works
+
+1. **You ask a question** — e.g., "What's the latest iPhone?"
+2. **AI evaluates** — Does this need real-time info?
+3. **If yes** → AI responds with `SEARCH: latest iPhone release`
+4. **Bot searches the web** — Using Brave API or DuckDuckGo
+5. **AI answers again** — Using search results to give an accurate, up-to-date response
+
+The search is a two-pass process:
+- **Pass 1**: AI decides if it needs to search (with a special prompt)
+- **Pass 2**: AI answers using web results (results don't pollute your conversation history)
+
+You can use `/web off` to disable this entirely, or `/web ddg` to use the free DuckDuckGo engine without any API key.
 
 ---
 
 ## 🔧 Troubleshooting
 
 ### Bot doesn't respond
-
 1. Check logs: `docker logs -f multi-ai-bot`
 2. Verify API keys are correct
-3. Ensure at least one provider API key is set
+3. Ensure at least one provider key is set
 
 ### "Not authorized" message
-
 - Add your Telegram user ID to `ALLOWED_USER_IDS`
 - Or remove `ALLOWED_USER_IDS` to allow anyone
 
 ### Provider errors
+- Switch provider: `/provider <name>`
+- Check rate limits — try again in a few minutes
+- Run `/validate` to find working models
 
-- Try switching to another provider: `/provider <name>`
-- Check if you've hit rate limits
-- Verify the specific provider's API key
+### Web search not working
+- Check if web search is enabled: `/web`
+- For Brave: ensure `BRAVE_API_KEY` is set
+- Try DuckDuckGo (no key needed): `/web ddg`
+
+### Models not loading
+- Run `/refresh` to re-fetch from APIs
+- Run `/validate` to test which models work
+- Run `/clearvalidation` then `/validate` to start fresh
 
 ---
 
-## 🛠️ Development
-
-### File Structure
+## 🛠️ Project Structure
 
 ```
 chat-telegram/
-├── bot.py              # Main bot code
-├── requirements.txt    # Python dependencies
-├── Dockerfile         # Docker configuration
-├── .env.example       # Example environment file
-└── README.md          # This file
-```
-
-### Local Development
-
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Set environment variables
-export TELEGRAM_TOKEN=your_token
-export GROQ_API_KEY=your_key
-# ... other keys
-
-# 3. Run
-python bot.py
+├── bot.py                  # Main bot (1862 lines — all features)
+├── requirements.txt        # Python dependencies
+├── Dockerfile              # Docker build config
+├── .env.example            # Example environment file
+├── validated_models.json   # Auto-generated validation cache
+├── clear_old_commands.py   # Utility to remove old bot commands
+├── esp32_bot.py            # ESP32 version of the bot
+├── ESP32-GUIDE.md          # ESP32 setup guide
+└── README.md               # This file
 ```
 
 ---
 
 ## 📝 License
 
-MIT License - Feel free to use and modify!
+MIT License — Feel free to use and modify!
 
 ---
 
@@ -302,7 +373,8 @@ Built with:
 - [OpenRouter](https://openrouter.ai/)
 - [Cerebras](https://cerebras.ai/)
 - [NVIDIA](https://build.nvidia.com/)
+- [Brave Search](https://brave.com/search/api/)
 
 ---
 
-**Need help?** Open an issue or check the logs for error messages!
+**Need help?** Open an issue or check the logs with `docker logs -f multi-ai-bot`
