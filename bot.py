@@ -218,6 +218,8 @@ class GroqProvider(AIProvider):
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
         )
+        if not response.choices or response.choices[0].message.content is None:
+            raise ValueError("API returned empty response (no choices or content). The model may be overloaded or unable to process this request.")
         return response.choices[0].message.content
     
     def get_available_models(self) -> List[Dict[str, str]]:
@@ -424,6 +426,8 @@ class OpenRouterProvider(AIProvider):
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
         )
+        if not response.choices or response.choices[0].message.content is None:
+            raise ValueError("API returned empty response (no choices or content). The model may be overloaded or unable to process this request.")
         return response.choices[0].message.content
     
     def get_available_models(self) -> List[Dict[str, str]]:
@@ -554,6 +558,8 @@ class CerebrasProvider(AIProvider):
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
         )
+        if not response.choices or response.choices[0].message.content is None:
+            raise ValueError("API returned empty response (no choices or content). The model may be overloaded or unable to process this request.")
         return response.choices[0].message.content
     
     def get_available_models(self) -> List[Dict[str, str]]:
@@ -695,6 +701,8 @@ class NvidiaProvider(AIProvider):
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
             )
+            if not response.choices or response.choices[0].message.content is None:
+                raise ValueError("API returned empty response (no choices or content). The model may be overloaded or unable to process this request.")
             return response.choices[0].message.content
     
     def get_available_models(self) -> List[Dict[str, str]]:
