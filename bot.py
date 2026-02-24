@@ -1734,7 +1734,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # LLM Loop: check if AI wants to search the web
         if web_on and bot_response.strip().upper().startswith("SEARCH:"):
-            query = bot_response.strip()[7:].strip()
+            # Extract only the first line after "SEARCH:" and cap length
+            # (some models hallucinate full answers appended to the query)
+            raw_query = bot_response.strip()[7:].strip()
+            query = raw_query.split('\n')[0].strip()[:200]
             if query:
                 engine = session.get("search_engine", "brave")
                 logger.info(f"[Bot] AI requested search ({engine}): '{query}'")

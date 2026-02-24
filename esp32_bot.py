@@ -968,8 +968,10 @@ def handle_message(chat_id, text, user_id):
 
     # LLM Loop: check if AI wants to search the web
     if web_on and response.strip().upper().startswith("SEARCH:"):
-        # Extract query after "SEARCH:" (case-insensitive, strip whitespace)
-        query = response.strip()[7:].strip()
+        # Extract only the first line after "SEARCH:" and cap length
+        # (some models hallucinate full answers appended to the query)
+        raw_query = response.strip()[7:].strip()
+        query = raw_query.split('\n')[0].strip()[:200]
         if query:
             engine = s.get("search_engine", "brave")
             print("[Bot] AI requested search (%s): '%s'" % (engine, query))
