@@ -105,10 +105,13 @@ def _wants_search(text):
     if length < 12:
         return 'no'
 
-    # Coding / creative / math tasks — never need search
+    # Coding / creative / math tasks — flag but don't return yet
+    # (search-need signals take priority when both are present)
+    no_hit = False
     for kw in _KW_NO_SEARCH:
         if kw in low:
-            return 'no'
+            no_hit = True
+            break
 
     # --- Check for strong search signals ---
     time_hit = False
@@ -139,6 +142,10 @@ def _wants_search(text):
     # Any single strong signal → let AI decide (inject search prompt)
     if time_hit or topic_hit or year_hit:
         return 'maybe'
+
+    # No search signals found → respect no-search keywords
+    if no_hit:
+        return 'no'
 
     # Questions with '?' that aren't about coding/explanation might need search
     if '?' in low and length > 20:
@@ -206,7 +213,6 @@ if GROQ_API_KEY:
         "key": GROQ_API_KEY,
         "default_model": "llama-3.3-70b-versatile",
         "fallback": [
-            "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
             "mixtral-8x7b-32768",
@@ -564,12 +570,18 @@ def tg_send(chat_id, text):
         if len(chunks) > 1:
             chunk = "[%d/%d]\n%s" % (i + 1, len(chunks), chunk)
         payload = ujson.dumps({"chat_id": chat_id, "text": chunk})
+        r = None
         try:
             r = urequests.post(url, data=payload,
                                headers={"Content-Type": "application/json"})
             r.close()
         except Exception as e:
             print("[TG] send error:", e)
+            if r:
+                try:
+                    r.close()
+                except Exception:
+                    pass
         del payload
         gc.collect()
 
@@ -1115,6 +1127,8 @@ def _do_search_and_answer(chat_id, s, query):
     engine = s.get("search_engine", "brave")
     print("[Bot] Searching (%s): '%s'" % (engine, query))
     tg_send_action(chat_id)
+    if wdt:
+        wdt.feed()
     snippets = web_search(query, engine)
 
     if not snippets:
@@ -1137,6 +1151,8 @@ def _do_search_and_answer(chat_id, s, query):
     search_msgs.append({"role": "assistant", "content": "I'll search the web for that."})
     search_msgs.append({"role": "user", "content": ctx + "\nUsing these search results, answer my original question concisely."})
     tg_send_action(chat_id)
+    if wdt:
+        wdt.feed()
     response = ai_chat(s["provider"], s["model"], search_msgs)
     del search_msgs
     del ctx
@@ -1189,6 +1205,8 @@ def handle_message(chat_id, text, user_id):
 
         query = _parse_search_response(response)
         if query:
+            del response
+            gc.collect()
             response = _do_search_and_answer(chat_id, s, query)
             del query
         else:
@@ -1200,14 +1218,23 @@ def handle_message(chat_id, text, user_id):
         response = ai_chat(s["provider"], s["model"], s["history"])
 
     # ── Store response & send ───────────────────────────────────────────
-    s["history"].append({"role": "assistant", "content": response})
+    # Don't pollute limited history with error messages (wastes precious slots)
+    is_error = (response.startswith("Error: provider") or
+                response.startswith("Error calling") or
+                response.startswith("API Error:") or
+                response.startswith("(no response from"))
+    if is_error:
+        # Roll back the user message that caused the error
+        if s["history"] and s["history"][-1].get("role") == "user":
+            s["history"].pop()
+    else:
+        s["history"].append({"role": "assistant", "content": response})
 
-    # Trim again after adding response
-    if len(s["history"]) > MAX_HISTORY:
-        s["history"] = s["history"][-MAX_HISTORY:]
+        # Trim again after adding response
+        if len(s["history"]) > MAX_HISTORY:
+            s["history"] = s["history"][-MAX_HISTORY:]
 
-    # Send to user (use history ref to avoid double-holding the string)
-    tg_send(chat_id, s["history"][-1]["content"])
+    tg_send(chat_id, response)
     del response
     gc.collect()
 
@@ -1275,6 +1302,8 @@ def main():
             continue
 
         for upd in updates:
+            if wdt:
+                wdt.feed()
             tg_offset = upd.get("update_id", 0) + 1
             msg = upd.get("message")
             if not msg:
