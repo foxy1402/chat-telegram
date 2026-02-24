@@ -33,10 +33,15 @@ BRAVE_API_KEY = os.getenv('BRAVE_API_KEY', '')
 SEARCH_ENGINE = os.getenv('SEARCH_ENGINE', 'brave').lower()  # "brave" or "duckduckgo"
 MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '3'))
 MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '300'))
-SEARCH_PROMPT = (" If the user's question requires very recent or real-time information"
-                 " (news, current events, live data, today's info),"
-                 " respond ONLY with: SEARCH: <your search query>"
-                 " Do NOT search for general knowledge you already know.")
+SEARCH_PROMPT = (
+    " You have access to web search. Your training data is outdated."
+    " You MUST use search for: prices, stocks, crypto, weather, news, current events,"
+    " sports scores, elections, releases, any question with"
+    " 'today', 'now', 'latest', 'current', 'recent', or specific dates."
+    " To search, respond ONLY with: SEARCH: <query>"
+    " Do NOT guess or make up answers for things you are not 100% certain about."
+    " When in doubt, SEARCH. Only skip search for timeless facts you are sure of."
+)
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
