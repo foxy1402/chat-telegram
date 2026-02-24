@@ -2,7 +2,7 @@
 
 > **A universal free AI model hub for Telegram** — Switch between Groq, Gemini, OpenRouter, Cerebras, and NVIDIA with simple commands. Built-in web search, model validation, and thinking mode!
 
-[![Docker Hub](https://img.shields.io/badge/docker-snoopylikefree5%2Fmulti--ai--bot-blue?logo=docker)](https://hub.docker.com/r/snoopylikefree5/multi-ai-bot)
+[![GHCR](https://img.shields.io/badge/ghcr.io-foxy1402%2Fchat--telegram-blue?logo=github)](https://github.com/foxy1402/chat-telegram/pkgs/container/chat-telegram)
 
 ---
 
@@ -16,7 +16,7 @@
 - 🔒 **User Whitelisting** — Restrict access to specific Telegram users
 - 💬 **Conversation History** — Context maintained across messages
 - 🆓 **100% Free** — Uses only free-tier APIs (no credit card required)
-- 🐳 **Docker Ready** — Pre-built image on Docker Hub
+- 🐳 **Docker Ready** — Pre-built image on GitHub Container Registry (GHCR)
 
 ---
 
@@ -50,7 +50,7 @@ To restrict access to only you:
 
 ## 📦 Deployment
 
-### Option 1: Docker Hub (Recommended)
+### Option 1: GHCR (Recommended)
 
 ```bash
 # Pull and run
@@ -59,10 +59,10 @@ docker run -d \
   -e GROQ_API_KEY=your_key \
   -e ALLOWED_USER_IDS=your_id \
   --name multi-ai-bot \
-  snoopylikefree5/multi-ai-bot:latest
+  ghcr.io/foxy1402/chat-telegram:latest
 
 # Or use .env file
-docker run -d --env-file .env --name multi-ai-bot snoopylikefree5/multi-ai-bot:latest
+docker run -d --env-file .env --name multi-ai-bot ghcr.io/foxy1402/chat-telegram:latest
 ```
 
 ```bash
@@ -76,7 +76,7 @@ docker start multi-ai-bot
 
 ### Option 2: Cloud Platforms (Claw Cloud, etc.)
 
-1. **Image**: `snoopylikefree5/multi-ai-bot:latest`
+1. **Image**: `ghcr.io/foxy1402/chat-telegram:latest`
 2. **Environment Variables**: Set your API keys
 3. **Deploy**: Platform pulls and runs automatically
 
