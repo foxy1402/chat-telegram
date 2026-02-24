@@ -55,20 +55,134 @@ MAX_HISTORY = 5  # Keep low for RAM — 5 messages ~2KB
 MAX_SESSIONS = 3  # Limit concurrent user sessions to save RAM
 MAX_RESPONSE_LEN = 4000  # Truncate AI responses beyond this to protect RAM
 SYSTEM_PROMPT = "You are a helpful AI assistant. Be concise. No markdown tables."
+
+# ============================================================================
+# CLIENT-SIDE SEARCH HEURISTIC — decide BEFORE calling the AI
+# Saves ~300 bytes of prompt tokens + an entire API round-trip
+# when search is clearly not needed (greetings, coding, math, etc.)
+# ============================================================================
+
+# Time-sensitive words → almost always need fresh data
+_KW_TIME = (
+    'today', 'tonight', 'now', 'latest', 'current', 'recent',
+    'yesterday', 'tomorrow', 'this week', 'this month', 'this year',
+    'last week', 'last month', 'last year', 'next week', 'next month',
+)
+# Topic words → usually need real-time data
+_KW_TOPIC = (
+    'price', 'stock', 'crypto', 'bitcoin', 'btc', 'eth', 'market', 'trading',
+    'weather', 'forecast', 'temperature',
+    'news', 'headline', 'election', 'vote', 'poll',
+    'score', 'game', 'match', 'tournament', 'playoff', 'standings',
+    'release', 'released', 'launched', 'announced', 'update',
+    'dead', 'died', 'alive', 'arrested', 'fired', 'hired', 'resigned',
+    'war', 'earthquake', 'hurricane', 'disaster', 'outbreak',
+)
+# Action words → coding/creative/math tasks that NEVER need search
+_KW_NO_SEARCH = (
+    'write', 'code', 'create', 'generate', 'build', 'make', 'implement',
+    'explain', 'define', 'describe', 'summarize', 'rewrite', 'translate',
+    'fix', 'debug', 'refactor', 'optimize', 'calculate', 'solve', 'convert',
+    'hello', 'hi ', 'hey ', 'thanks', 'thank you', 'bye', 'good morning',
+    'tell me a joke', 'poem', 'story', 'essay', 'list',
+)
+
+
+def _wants_search(text):
+    """Lightweight client-side heuristic: should this message get search capability?
+
+    Returns one of:
+      'direct'  — high confidence search is needed, skip AI ask, search immediately
+      'maybe'   — inject search prompt, let AI decide
+      'no'      — definitely no search needed, save tokens + RAM
+
+    This runs BEFORE any API call, saving an entire round-trip for non-search messages
+    and optionally saving TWO round-trips when we can search directly."""
+    low = text.lower()
+    length = len(low)
+
+    # Very short messages (< 12 chars) are greetings/reactions — never search
+    if length < 12:
+        return 'no'
+
+    # Coding / creative / math tasks — never need search
+    for kw in _KW_NO_SEARCH:
+        if kw in low:
+            return 'no'
+
+    # --- Check for strong search signals ---
+    time_hit = False
+    for kw in _KW_TIME:
+        if kw in low:
+            time_hit = True
+            break
+
+    topic_hit = False
+    for kw in _KW_TOPIC:
+        if kw in low:
+            topic_hit = True
+            break
+
+    # Recent year mentioned (current year ± 1)
+    t = time.localtime()
+    year = t[0]
+    year_hit = False
+    for y in (str(year - 1), str(year), str(year + 1)):
+        if y in low:
+            year_hit = True
+            break
+
+    # Both time + topic → very high confidence, search directly
+    if time_hit and topic_hit:
+        return 'direct'
+
+    # Any single strong signal → let AI decide (inject search prompt)
+    if time_hit or topic_hit or year_hit:
+        return 'maybe'
+
+    # Questions with '?' that aren't about coding/explanation might need search
+    if '?' in low and length > 20:
+        # "who is/was/won" patterns
+        if 'who ' in low:
+            return 'maybe'
+        # "how much" / "how many" often need current data
+        if 'how much' in low or 'how many' in low:
+            return 'maybe'
+        # "where is" can be factual
+        if 'where ' in low:
+            return 'maybe'
+
+    return 'no'
+
+
+def _extract_search_query(text):
+    """Extract a clean search query from the user message for direct search.
+    Strips filler words and caps at 120 chars for a clean API query."""
+    # Remove common question prefixes
+    low = text.strip()
+    for prefix in ('what is the', 'what are the', 'what is', 'what are',
+                   'how much is', 'how much does', 'how much',
+                   'who is the', 'who is', 'who won the', 'who won',
+                   'where is the', 'where is',
+                   'when is the', 'when is', 'when does',
+                   'tell me about', 'search for', 'look up', 'find'):
+        if low.lower().startswith(prefix):
+            low = low[len(prefix):].strip()
+            break
+    # Remove trailing question mark
+    low = low.rstrip('?').strip()
+    return low[:120] if low else text[:120]
+
+
 def get_search_prompt():
-    """Build search prompt with today's date so the AI knows the current year."""
+    """Build search prompt with today's date so the AI knows the current year.
+    Kept concise — every byte costs RAM on ESP32."""
     t = time.localtime()
     today = "%04d-%02d-%02d" % (t[0], t[1], t[2])
     return (
-        " Today's date is %s." % today
-        + " You have access to web search. Your training data is outdated."
-        " You MUST use search for: prices, stocks, crypto, weather, news, current events,"
-        " sports scores, elections, releases, any question with"
-        " 'today', 'now', 'latest', 'current', 'recent', or specific dates."
-        " To search, respond ONLY with: SEARCH: <short query>"
-        " Keep the search query short and clean — just keywords, no extra text."
-        " Do NOT guess or make up answers for things you are not 100%% certain about."
-        " When in doubt, SEARCH. Only skip search for timeless facts you are sure of."
+        " Today is %s." % today
+        + " You can search the web. To search, reply ONLY: SEARCH: <keywords>"
+        " Keep queries short (2-5 words). Do not guess outdated facts — search instead."
     )
 
 # ============================================================================
@@ -965,9 +1079,81 @@ def handle_command(chat_id, text, user_id):
 # MESSAGE HANDLER
 # ============================================================================
 
+def _parse_search_response(response):
+    """Parse AI response for SEARCH: directive. Returns cleaned query or None.
+    Handles common model quirks: repeated prefixes, quoted queries, extra text."""
+    stripped = response.strip()
+    upper = stripped.upper()
+
+    # Must start with SEARCH: (possibly after whitespace)
+    if not upper.startswith("SEARCH:"):
+        return None
+
+    # Take only the first line (models sometimes append full answers)
+    raw = stripped[7:].strip()
+    query = raw.split('\n')[0].strip()
+
+    # Strip quotes some models wrap around the query
+    if len(query) > 2 and query[0] == '"' and query[-1] == '"':
+        query = query[1:-1].strip()
+    if len(query) > 2 and query[0] == "'" and query[-1] == "'":
+        query = query[1:-1].strip()
+
+    # Strip repeated SEARCH: prefixes (some models echo it)
+    safety = 3  # max iterations to prevent infinite loop
+    while safety > 0 and query.upper().startswith('SEARCH:'):
+        query = query[7:].strip()
+        safety -= 1
+
+    query = query[:150]  # cap length for search API
+    return query if query else None
+
+
+def _do_search_and_answer(chat_id, s, query):
+    """Perform web search and call AI with results. Returns response string.
+    Shared by both direct-search and AI-requested-search paths."""
+    engine = s.get("search_engine", "brave")
+    print("[Bot] Searching (%s): '%s'" % (engine, query))
+    tg_send_action(chat_id)
+    snippets = web_search(query, engine)
+
+    if not snippets:
+        # Search returned nothing — let AI answer from its knowledge
+        del snippets
+        gc.collect()
+        return ai_chat(s["provider"], s["model"], s["history"])
+
+    # Build search context (use list+join instead of += to avoid O(n²) copies)
+    parts = ["Web results for '%s':" % query]
+    for i, snip in enumerate(snippets):
+        parts.append("%d. %s" % (i + 1, snip))
+    ctx = '\n'.join(parts)
+    del snippets
+    del parts
+    gc.collect()
+
+    # Build messages for second pass (shallow copy history, add search context)
+    search_msgs = list(s["history"])
+    search_msgs.append({"role": "assistant", "content": "I'll search the web for that."})
+    search_msgs.append({"role": "user", "content": ctx + "\nUsing these search results, answer my original question concisely."})
+    tg_send_action(chat_id)
+    response = ai_chat(s["provider"], s["model"], search_msgs)
+    del search_msgs
+    del ctx
+    gc.collect()
+    return response
+
+
 def handle_message(chat_id, text, user_id):
     """Handle regular text messages — forward to AI provider.
-    Includes LLM loop: if AI requests a web search, fetch results and re-query."""
+
+    Smart search flow (3 tiers):
+      1. 'no'     → no search prompt, no search API call  (cheapest)
+      2. 'direct' → skip AI ask, search immediately       (1 AI call saved)
+      3. 'maybe'  → inject search prompt, let AI decide   (current behavior)
+
+    This saves RAM, tokens, and latency for the majority of messages
+    that don't need web search (greetings, coding, math, creative tasks)."""
     s = get_session(user_id)
 
     # Add to history (truncate very long messages to protect RAM)
@@ -982,52 +1168,38 @@ def handle_message(chat_id, text, user_id):
     # Send typing indicator
     tg_send_action(chat_id)
 
-    # Build system prompt — append search instructions if web search is on
+    # ── Decide search strategy ──────────────────────────────────────────
     web_on = s.get("web_search")
-    prompt = SYSTEM_PROMPT + get_search_prompt() if web_on else None
+    search_tier = _wants_search(text) if web_on else 'no'
+    print("[Bot] msg=%d chars, search_tier=%s" % (len(text), search_tier))
 
-    # Pass 1: Call AI (with search-aware prompt if web is on)
-    response = ai_chat(s["provider"], s["model"], s["history"], prompt)
+    # ── Tier 1: DIRECT SEARCH ───────────────────────────────────────────
+    # High-confidence search need → extract query from user text, search
+    # immediately, then call AI ONCE with results.  Saves one API call.
+    if search_tier == 'direct':
+        query = _extract_search_query(text)
+        response = _do_search_and_answer(chat_id, s, query)
 
-    # LLM Loop: check if AI wants to search the web
-    if web_on and response.strip().upper().startswith("SEARCH:"):
-        # Extract only the first line after "SEARCH:" and cap length
-        # (some models hallucinate full answers appended to the query)
-        raw_query = response.strip()[7:].strip()
-        query = raw_query.split('\n')[0].strip()[:200]
-        # Strip repeated SEARCH: prefixes some models output inline
-        upper_q = query.upper()
-        while 'SEARCH:' in upper_q:
-            idx = upper_q.index('SEARCH:')
-            query = query[:idx].strip()
-            upper_q = query.upper()
-        query = query.strip()[:200]
+    # ── Tier 2: MAYBE SEARCH ────────────────────────────────────────────
+    # Possible search need → inject search prompt, let AI decide.
+    # If AI says SEARCH:, perform it. If not, use the direct answer.
+    elif search_tier == 'maybe':
+        prompt = SYSTEM_PROMPT + get_search_prompt()
+        response = ai_chat(s["provider"], s["model"], s["history"], prompt)
+
+        query = _parse_search_response(response)
         if query:
-            engine = s.get("search_engine", "brave")
-            print("[Bot] AI requested search (%s): '%s'" % (engine, query))
-            tg_send_action(chat_id)  # refresh typing indicator
-            snippets = web_search(query, engine)
-            if snippets:
-                # Build search context for second pass
-                ctx = "Web results for '%s':\n" % query
-                for i, snip in enumerate(snippets):
-                    ctx += "%d. %s\n" % (i + 1, snip)
-                del snippets
-                # Second pass with search context (don't pollute history)
-                search_msgs = list(s["history"])  # shallow copy
-                search_msgs.append({"role": "assistant", "content": "I'll search the web for that."})
-                search_msgs.append({"role": "user", "content": ctx + "\nUsing these search results, answer my original question concisely."})
-                tg_send_action(chat_id)
-                response = ai_chat(s["provider"], s["model"], search_msgs)
-                del search_msgs
-                del ctx
-                gc.collect()
-            else:
-                # Search failed — retry without search prompt so AI answers normally
-                del snippets
-                response = ai_chat(s["provider"], s["model"], s["history"])
+            response = _do_search_and_answer(chat_id, s, query)
+            del query
+        else:
+            del query
 
-    # Add response to history
+    # ── Tier 3: NO SEARCH ───────────────────────────────────────────────
+    # No search signals → plain AI call, no search prompt overhead.
+    else:
+        response = ai_chat(s["provider"], s["model"], s["history"])
+
+    # ── Store response & send ───────────────────────────────────────────
     s["history"].append({"role": "assistant", "content": response})
 
     # Trim again after adding response
