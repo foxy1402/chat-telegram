@@ -33,15 +33,21 @@ BRAVE_API_KEY = os.getenv('BRAVE_API_KEY', '')
 SEARCH_ENGINE = os.getenv('SEARCH_ENGINE', 'brave').lower()  # "brave" or "duckduckgo"
 MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '3'))
 MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '300'))
-SEARCH_PROMPT = (
-    " You have access to web search. Your training data is outdated."
-    " You MUST use search for: prices, stocks, crypto, weather, news, current events,"
-    " sports scores, elections, releases, any question with"
-    " 'today', 'now', 'latest', 'current', 'recent', or specific dates."
-    " To search, respond ONLY with: SEARCH: <query>"
-    " Do NOT guess or make up answers for things you are not 100% certain about."
-    " When in doubt, SEARCH. Only skip search for timeless facts you are sure of."
-)
+def get_search_prompt() -> str:
+    """Build search prompt with today's date so the AI knows the current year."""
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    return (
+        f" Today's date is {today}."
+        " You have access to web search. Your training data is outdated."
+        " You MUST use search for: prices, stocks, crypto, weather, news, current events,"
+        " sports scores, elections, releases, any question with"
+        " 'today', 'now', 'latest', 'current', 'recent', or specific dates."
+        " To search, respond ONLY with: SEARCH: <short query>"
+        " Keep the search query short and clean — just keywords, no extra text."
+        " Do NOT guess or make up answers for things you are not 100% certain about."
+        " When in doubt, SEARCH. Only skip search for timeless facts you are sure of."
+    )
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
@@ -1717,12 +1723,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if pass1_messages and pass1_messages[0].get("role") == "system":
                 pass1_messages[0] = {
                     "role": "system",
-                    "content": pass1_messages[0]["content"] + SEARCH_PROMPT
+                    "content": pass1_messages[0]["content"] + get_search_prompt()
                 }
             else:
                 pass1_messages.insert(0, {
                     "role": "system",
-                    "content": SYSTEM_PROMPT + SEARCH_PROMPT
+                    "content": SYSTEM_PROMPT + get_search_prompt()
                 })
         
         # Pass 1: Call AI (with search-aware prompt if web is on)
@@ -1738,6 +1744,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # (some models hallucinate full answers appended to the query)
             raw_query = bot_response.strip()[7:].strip()
             query = raw_query.split('\n')[0].strip()[:200]
+            # Strip repeated SEARCH: prefixes some models output inline
+            while 'SEARCH:' in query.upper():
+                idx = query.upper().index('SEARCH:')
+                query = query[:idx].strip()
+            query = query.strip()[:200]
             if query:
                 engine = session.get("search_engine", "brave")
                 logger.info(f"[Bot] AI requested search ({engine}): '{query}'")

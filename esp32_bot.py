@@ -55,15 +55,21 @@ MAX_HISTORY = 5  # Keep low for RAM — 5 messages ~2KB
 MAX_SESSIONS = 3  # Limit concurrent user sessions to save RAM
 MAX_RESPONSE_LEN = 4000  # Truncate AI responses beyond this to protect RAM
 SYSTEM_PROMPT = "You are a helpful AI assistant. Be concise. No markdown tables."
-SEARCH_PROMPT = (
-    " You have access to web search. Your training data is outdated."
-    " You MUST use search for: prices, stocks, crypto, weather, news, current events,"
-    " sports scores, elections, releases, any question with"
-    " 'today', 'now', 'latest', 'current', 'recent', or specific dates."
-    " To search, respond ONLY with: SEARCH: <query>"
-    " Do NOT guess or make up answers for things you are not 100%% certain about."
-    " When in doubt, SEARCH. Only skip search for timeless facts you are sure of."
-)
+def get_search_prompt():
+    """Build search prompt with today's date so the AI knows the current year."""
+    t = time.localtime()
+    today = "%04d-%02d-%02d" % (t[0], t[1], t[2])
+    return (
+        " Today's date is %s." % today
+        + " You have access to web search. Your training data is outdated."
+        " You MUST use search for: prices, stocks, crypto, weather, news, current events,"
+        " sports scores, elections, releases, any question with"
+        " 'today', 'now', 'latest', 'current', 'recent', or specific dates."
+        " To search, respond ONLY with: SEARCH: <short query>"
+        " Keep the search query short and clean — just keywords, no extra text."
+        " Do NOT guess or make up answers for things you are not 100%% certain about."
+        " When in doubt, SEARCH. Only skip search for timeless facts you are sure of."
+    )
 
 # ============================================================================
 # PROVIDER DEFINITIONS
@@ -326,6 +332,23 @@ def wifi_connect():
 
     print("[WiFi] Connected!", wlan.ifconfig()[0])
     return wlan
+
+
+def sync_ntp():
+    """Sync ESP32 RTC with NTP so we know the real date/time."""
+    import ntptime
+    # Try multiple NTP servers in case one is blocked or slow
+    for server in ("pool.ntp.org", "time.google.com"):
+        try:
+            ntptime.host = server
+            ntptime.settime()  # sets RTC to UTC
+            t = time.localtime()
+            print("[NTP] Time synced via %s: %04d-%02d-%02d %02d:%02d:%02d UTC" % (
+                server, t[0], t[1], t[2], t[3], t[4], t[5]))
+            return
+        except Exception as e:
+            print("[NTP] %s failed: %s" % (server, e))
+    print("[NTP] All servers failed (non-critical) — date in search prompt may be wrong")
 
 # ============================================================================
 # DUCKDNS UPDATER
@@ -961,7 +984,7 @@ def handle_message(chat_id, text, user_id):
 
     # Build system prompt — append search instructions if web search is on
     web_on = s.get("web_search")
-    prompt = SYSTEM_PROMPT + SEARCH_PROMPT if web_on else None
+    prompt = SYSTEM_PROMPT + get_search_prompt() if web_on else None
 
     # Pass 1: Call AI (with search-aware prompt if web is on)
     response = ai_chat(s["provider"], s["model"], s["history"], prompt)
@@ -972,6 +995,13 @@ def handle_message(chat_id, text, user_id):
         # (some models hallucinate full answers appended to the query)
         raw_query = response.strip()[7:].strip()
         query = raw_query.split('\n')[0].strip()[:200]
+        # Strip repeated SEARCH: prefixes some models output inline
+        upper_q = query.upper()
+        while 'SEARCH:' in upper_q:
+            idx = upper_q.index('SEARCH:')
+            query = query[:idx].strip()
+            upper_q = query.upper()
+        query = query.strip()[:200]
         if query:
             engine = s.get("search_engine", "brave")
             print("[Bot] AI requested search (%s): '%s'" % (engine, query))
@@ -1034,6 +1064,9 @@ def main():
     # Step 1: Connect WiFi (retries forever)
     wlan = wifi_connect()
 
+    # Step 1.5: Sync time via NTP (so AI knows the current date)
+    sync_ntp()
+
     # Step 2: Initial DuckDNS update
     last_duckdns = 0  # force immediate update
     update_duckdns()
@@ -1053,6 +1086,7 @@ def main():
         if not wlan.isconnected():
             print("[WiFi] Connection lost, reconnecting...")
             wlan = wifi_connect()
+            sync_ntp()  # re-sync time after reconnect
             last_duckdns = 0  # force DuckDNS update after reconnect
             update_duckdns()
 
