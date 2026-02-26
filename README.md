@@ -140,8 +140,12 @@ TEMPERATURE=0.7
 # Max messages kept in conversation history
 MAX_HISTORY_MESSAGES=20
 
-# System prompt (customize AI personality)
+# System prompt override (highest priority, optional)
 SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the point.
+
+# Prompt file to load when SYSTEM_PROMPT is not set
+# Default: perplexity-Prompt.txt
+SYSTEM_PROMPT_FILE=perplexity-Prompt.txt
 ```
 
 ### Web Search

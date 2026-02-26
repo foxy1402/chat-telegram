@@ -25,8 +25,50 @@ DEFAULT_PROVIDER = os.getenv('DEFAULT_PROVIDER', 'groq')
 MAX_TOKENS = int(os.getenv('MAX_TOKENS', '512'))  # Configurable token limit (lower = more concise)
 TEMPERATURE = float(os.getenv('TEMPERATURE', '0.7'))  # Configurable temperature (0.0-1.0)
 MAX_HISTORY_MESSAGES = int(os.getenv('MAX_HISTORY_MESSAGES', '20'))  # Configurable history length
-SYSTEM_PROMPT = os.getenv('SYSTEM_PROMPT', 'You are a helpful AI assistant. Be concise and straight to the point. Avoid unnecessary explanations unless specifically asked.')
+PROMPT_FILE = os.getenv('SYSTEM_PROMPT_FILE', 'perplexity-Prompt.txt')
 MAX_MESSAGE_LENGTH = 4096  # Telegram's per-message character limit
+
+
+def load_system_prompt() -> str:
+    """Load system prompt from env/file and adapt it for Telegram chat UX."""
+    env_prompt = os.getenv('SYSTEM_PROMPT')
+    if env_prompt and env_prompt.strip():
+        return env_prompt.strip()
+
+    fallback_prompt = (
+        "You are a helpful AI assistant. Be concise and straight to the point. "
+        "Avoid unnecessary explanations unless specifically asked."
+    )
+
+    prompt_path = os.path.join(os.path.dirname(__file__), PROMPT_FILE)
+    if not os.path.exists(prompt_path):
+        logger.warning(f"Prompt file not found: {prompt_path}. Using fallback prompt.")
+        return fallback_prompt
+
+    try:
+        with open(prompt_path, 'r', encoding='utf-8') as f:
+            base_prompt = f.read().strip()
+    except Exception as e:
+        logger.warning(f"Failed to read prompt file '{prompt_path}': {e}. Using fallback prompt.")
+        return fallback_prompt
+
+    # Keep the imported prompt but override conflicting source/citation rules for this bot context.
+    telegram_override = """
+
+<telegram_bot_adaptation>
+For this Telegram bot environment, these instructions override conflicting rules above:
+- You are not given structured source indices by default. Do NOT fabricate citation markers like [1] or [2].
+- If no explicit sources are provided in the conversation, answer with your best knowledge and clearly mark uncertainty when needed.
+- Optimize for Telegram readability: concise opening summary, short sections, flat bullet lists, short paragraphs.
+- Use Markdown formatting that is simple and robust in chat. Prefer headings, bullets, and fenced code blocks.
+- Keep responses practical and avoid unnecessary verbosity unless asked for detail.
+</telegram_bot_adaptation>
+""".strip()
+
+    return f"{base_prompt}\n\n{telegram_override}"
+
+
+SYSTEM_PROMPT = load_system_prompt()
 
 # Web Search Configuration
 BRAVE_API_KEY = os.getenv('BRAVE_API_KEY', '')
@@ -48,6 +90,14 @@ def get_search_prompt() -> str:
         " Do NOT guess or make up answers for things you are not 100% certain about."
         " When in doubt, SEARCH. Only skip search for timeless facts you are sure of."
     )
+
+
+async def reply_text_safe(message, text: str):
+    """Send Markdown first for better chat UI, then fallback to plain text."""
+    try:
+        await message.reply_text(text, parse_mode='Markdown')
+    except Exception:
+        await message.reply_text(text)
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
@@ -1794,7 +1844,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Send response (handle Telegram's 4096 char limit)
         if len(bot_response) <= MAX_MESSAGE_LENGTH:
-            await update.message.reply_text(bot_response)
+            await reply_text_safe(update.message, bot_response)
         else:
             # Reserve space for part header (e.g. "📄 Part 99/99\n\n")
             HEADER_RESERVE = 25
@@ -1829,9 +1879,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, chunk in enumerate(chunks, 1):
                 if len(chunks) > 1:
                     header = f"📄 Part {i}/{len(chunks)}\n\n"
-                    await update.message.reply_text(header + chunk)
+                    await reply_text_safe(update.message, header + chunk)
                 else:
-                    await update.message.reply_text(chunk)
+                    await reply_text_safe(update.message, chunk)
         
     except Exception as e:
         logger.error(f"Error in handle_message: {e}", exc_info=True)
