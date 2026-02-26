@@ -176,7 +176,24 @@ This is the key step. The ESP32 runs `main.py` automatically every time it power
 
 > **Why `main.py`?** MicroPython automatically runs `main.py` on every boot. This is how it auto-starts when plugged into power.
 
-### 5.2 — Test It
+### 5.2 — Upload Prompt File (Required for Perplexity Prompt)
+
+If your `esp32_bot.py` uses:
+
+```python
+SYSTEM_PROMPT_FILE = "perplexity-Prompt.txt"
+```
+
+you must also upload that file to the ESP32 filesystem.
+
+1. In Thonny, open local `perplexity-Prompt.txt`
+2. Go to **File → Save as...**
+3. Choose **MicroPython device**
+4. Save as exactly: **`perplexity-Prompt.txt`**
+
+Store it in the same root location as `main.py` (no folder needed).
+
+### 5.3 — Test It
 
 1. Press the **RESET** button on the ESP32 (or unplug and replug)
 2. Watch Thonny's Shell — you should see:
@@ -186,6 +203,7 @@ This is the key step. The ESP32 runs `main.py` automatically every time it power
 ESP32-C3 Telegram Bot starting...
 Providers: groq
 ========================================
+[Prompt] Loaded from file: perplexity-Prompt.txt
 [WDT] Watchdog enabled (120s timeout)
 [WiFi] Connecting to MyWiFiNetwork
 [WiFi] Connected! 192.168.1.xx
@@ -196,7 +214,15 @@ Providers: groq
 
 3. Send a message to your bot on Telegram — it should reply! 🎉
 
-### 5.3 — Disconnect & Power On
+If the prompt file is missing, you'll see:
+
+```
+[Prompt] Using fallback default (...)
+```
+
+and the bot will still run, but without the file-based Perplexity prompt.
+
+### 5.4 — Disconnect & Power On
 
 Once tested, you can:
 - Close Thonny
@@ -294,7 +320,8 @@ When enabled, the bot can search the web for real-time information:
 3. Click **Stop/Restart** (red button) to interrupt the running script
 4. Open the new `esp32_bot.py` in Thonny
 5. **File → Save as → MicroPython device → `main.py`**
-6. Press RESET on the board
+6. If prompt changed, also upload `perplexity-Prompt.txt` to **MicroPython device**
+7. Press RESET on the board
 
 ---
 

@@ -54,7 +54,62 @@ TEMPERATURE = 0.7
 MAX_HISTORY = 5  # Keep low for RAM — 5 messages ~2KB
 MAX_SESSIONS = 3  # Limit concurrent user sessions to save RAM
 MAX_RESPONSE_LEN = 4000  # Truncate AI responses beyond this to protect RAM
+SYSTEM_PROMPT_FILE = "perplexity-Prompt.txt"  # Copy this file to ESP32 filesystem
+SYSTEM_PROMPT_MAX_CHARS = 12000  # Hard cap to avoid runaway RAM usage
 SYSTEM_PROMPT = "You are a helpful AI assistant. Be concise. No markdown tables."
+
+
+def _compact_prompt(text):
+    """Compact prompt text to reduce RAM usage and token overhead on ESP32."""
+    lines = []
+    prev_blank = False
+    for raw in text.split('\n'):
+        line = raw.strip()
+        if not line:
+            if not prev_blank:
+                lines.append("")
+            prev_blank = True
+            continue
+        prev_blank = False
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def load_system_prompt():
+    """Load prompt from file with Telegram + ESP32 overrides. Fallback to default."""
+    global SYSTEM_PROMPT
+    try:
+        f = open(SYSTEM_PROMPT_FILE, "r")
+        data = f.read(SYSTEM_PROMPT_MAX_CHARS)
+        f.close()
+        if not data:
+            raise Exception("empty file")
+
+        base = _compact_prompt(data)
+        del data
+
+        # Override conflicting rules for this bot context.
+        # Keep concise to reduce payload size on each API call.
+        override = (
+            "\n\n<telegram_bot_adaptation>\n"
+            "- For Telegram chat, use short sections and flat bullet lists.\n"
+            "- Prefer clean Markdown (headings, bullets, fenced code blocks).\n"
+            "- Do NOT fabricate citation markers like [1] when no indexed sources are provided.\n"
+            "- Keep answers practical and concise unless the user asks for detail.\n"
+            "</telegram_bot_adaptation>\n"
+            "<esp32_constraints>\n"
+            "- Keep responses compact to reduce latency and memory usage on constrained hardware.\n"
+            "- Avoid overly long preambles.\n"
+            "</esp32_constraints>"
+        )
+        SYSTEM_PROMPT = base + override
+        del base
+        gc.collect()
+        print("[Prompt] Loaded from file:", SYSTEM_PROMPT_FILE)
+    except Exception as e:
+        SYSTEM_PROMPT = "You are a helpful AI assistant. Be concise. No markdown tables."
+        print("[Prompt] Using fallback default (%s)" % e)
+        gc.collect()
 
 # ============================================================================
 # CLIENT-SIDE SEARCH HEURISTIC — decide BEFORE calling the AI
@@ -570,20 +625,38 @@ def tg_send(chat_id, text):
     for i, chunk in enumerate(chunks):
         if len(chunks) > 1:
             chunk = "[%d/%d]\n%s" % (i + 1, len(chunks), chunk)
-        payload = ujson.dumps({"chat_id": chat_id, "text": chunk})
-        r = None
-        try:
-            r = urequests.post(url, data=payload,
-                               headers={"Content-Type": "application/json"})
-            r.close()
-        except Exception as e:
-            print("[TG] send error:", e)
-            if r:
-                try:
-                    r.close()
-                except Exception:
-                    pass
-        del payload
+        sent = False
+        # Try Markdown first for better Telegram UI, then fallback to plain text.
+        for try_markdown in (True, False):
+            payload_obj = {"chat_id": chat_id, "text": chunk}
+            if try_markdown:
+                payload_obj["parse_mode"] = "Markdown"
+            payload = ujson.dumps(payload_obj)
+            del payload_obj
+            r = None
+            try:
+                r = urequests.post(url, data=payload,
+                                   headers={"Content-Type": "application/json"})
+                body = r.json()
+                r.close()
+                r = None
+                ok = bool(body.get("ok"))
+                del body
+                sent = ok
+                if ok:
+                    break
+            except Exception as e:
+                print("[TG] send error:", e)
+            finally:
+                if r:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+            del payload
+            gc.collect()
+        if not sent:
+            print("[TG] message failed after markdown/plain retry")
         gc.collect()
 
 def tg_send_action(chat_id):
@@ -1255,6 +1328,9 @@ def main():
     if not PROVIDERS:
         print("ERROR: No API keys configured! Edit the config section.")
         return
+
+    # Load system prompt from on-device file if present.
+    load_system_prompt()
 
     # Hardware watchdog — auto-reboots if loop hangs for 120s
     global wdt
