@@ -176,35 +176,17 @@ This is the key step. The ESP32 runs `main.py` automatically every time it power
 
 > **Why `main.py`?** MicroPython automatically runs `main.py` on every boot. This is how it auto-starts when plugged into power.
 
-### 5.2 — Upload Prompt File (Required for Perplexity Prompt)
-
-If your `esp32_bot.py` uses:
-
-```python
-SYSTEM_PROMPT_FILE = "perplexity-Prompt.txt"
-```
-
-you must also upload that file to the ESP32 filesystem.
-
-1. In Thonny, open local `perplexity-Prompt.txt`
-2. Go to **File → Save as...**
-3. Choose **MicroPython device**
-4. Save as exactly: **`perplexity-Prompt.txt`**
-
-Store it in the same root location as `main.py` (no folder needed).
-
-### 5.3 — Test It
+### 5.2 — Test It
 
 1. Press the **RESET** button on the ESP32 (or unplug and replug)
 2. Watch Thonny's Shell — you should see:
 
 ```
 ========================================
-ESP32-C3 Telegram Bot starting...
+ESP32-C3 Telegram Bot v2 starting...
 Providers: groq
 ========================================
-[Prompt] Loaded from file: perplexity-Prompt.txt
-[WDT] Watchdog enabled (120s timeout)
+[WDT] Watchdog enabled (120s)
 [WiFi] Connecting to MyWiFiNetwork
 [WiFi] Connected! 192.168.1.xx
 [Bot] Fetching model lists...
@@ -214,15 +196,7 @@ Providers: groq
 
 3. Send a message to your bot on Telegram — it should reply! 🎉
 
-If the prompt file is missing, you'll see:
-
-```
-[Prompt] Using fallback default (...)
-```
-
-and the bot will still run, but without the file-based Perplexity prompt.
-
-### 5.4 — Disconnect & Power On
+### 5.3 — Disconnect & Power On
 
 Once tested, you can:
 - Close Thonny
@@ -271,11 +245,12 @@ Send these to your bot in Telegram:
 When enabled, the bot can search the web for real-time information:
 
 1. You ask: *"What's the weather in Bangkok today?"*
-2. AI decides it needs current data → internally sends `SEARCH: weather Bangkok today`
-3. Bot searches the web (Brave or DuckDuckGo) → gets snippets
-4. AI reads the snippets → gives you an informed answer
+2. Bot detects search intent with a lightweight keyword heuristic
+3. Bot directly builds a clean query and searches (Brave or DuckDuckGo)
+4. Bot sends your question + search snippets to the model in one AI call
+5. AI returns an informed answer
 
-**This is automatic** — you just chat normally. The AI decides when to search.
+**This is automatic** — you just chat normally. No `SEARCH:` round-trip is required in v2.
 
 ---
 
@@ -303,7 +278,7 @@ When enabled, the bot can search the web for real-time information:
 ### `MemoryError` or random crashes
 
 - This is normal — the ESP32-C3 has only 400 KB RAM
-- Keep `MAX_HISTORY = 5` (don't increase it)
+- Keep `MAX_HISTORY = 6` (must be even: user+assistant pairs)
 - Keep `MAX_SESSIONS = 3`
 - The bot auto-reboots after fatal crashes (10 second delay)
 
@@ -320,8 +295,7 @@ When enabled, the bot can search the web for real-time information:
 3. Click **Stop/Restart** (red button) to interrupt the running script
 4. Open the new `esp32_bot.py` in Thonny
 5. **File → Save as → MicroPython device → `main.py`**
-6. If prompt changed, also upload `perplexity-Prompt.txt` to **MicroPython device**
-7. Press RESET on the board
+6. Press RESET on the board
 
 ---
 
@@ -331,11 +305,12 @@ These defaults are tuned for the 400 KB ESP32-C3:
 
 ```python
 MAX_TOKENS = 512       # AI response length limit
-MAX_HISTORY = 5        # Chat messages kept in memory
+MAX_HISTORY = 6        # Must be even; keeps complete user/assistant pairs
 MAX_SESSIONS = 3       # Concurrent user sessions
 MAX_RESPONSE_LEN = 4000  # Truncate oversized responses
 MAX_SEARCH_RESULTS = 3   # Search results per query
 MAX_SNIPPET_LEN = 200    # Characters per search snippet
+RATE_LIMIT_SECS = 2      # Per-user message throttle
 ```
 
 > ⚠️ **Do not increase these values** unless you know what you're doing. The ESP32-C3 will crash with `MemoryError` if RAM runs out.
@@ -354,11 +329,11 @@ MAX_SNIPPET_LEN = 200    # Characters per search snippet
 │    ├── Telegram Long-Poll Loop       │
 │    │     ├── /commands → handler     │
 │    │     └── messages → AI chat      │
-│    │           ├── Pass 1: AI reply  │
-│    │           ├── SEARCH: detected? │
-│    │           │    ├── Brave API    │
-│    │           │    └── DuckDuckGo   │
-│    │           └── Pass 2: answer    │
+│    │           ├── Heuristic search? │
+│    │           │    ├── Yes: Web API │
+│    │           │    │      + AI call │
+│    │           │    └── No: AI call  │
+│    │           └── History pair trim │
 │    └── Watchdog Timer (120s)         │
 │                                      │
 │  Providers: Groq, Gemini, OpenRouter │

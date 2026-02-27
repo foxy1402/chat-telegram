@@ -137,15 +137,8 @@ MAX_TOKENS=512
 # Temperature (0.0 = deterministic, 0.7 = balanced, 1.0 = creative)
 TEMPERATURE=0.7
 
-# Max messages kept in conversation history
+# Max messages kept in conversation history (should be even: user+assistant pairs)
 MAX_HISTORY_MESSAGES=20
-
-# System prompt override (highest priority, optional)
-SYSTEM_PROMPT=You are a helpful AI assistant. Be concise and straight to the point.
-
-# Prompt file to load when SYSTEM_PROMPT is not set
-# Default: perplexity-Prompt.txt
-SYSTEM_PROMPT_FILE=perplexity-Prompt.txt
 ```
 
 ### Web Search
@@ -265,7 +258,7 @@ You: /web on
 Bot: ✅ Web search enabled (Brave API).
 
 You: What happened in tech news today?
-Bot: (AI detects this needs real-time info, searches the web, then answers)
+Bot: (Bot detects this needs real-time info, searches the web, then answers)
      Based on today's news: ...
 ```
 
@@ -304,14 +297,10 @@ Bot: ✅ Verified Models for NVIDIA:
 ## 🌐 How Web Search Works
 
 1. **You ask a question** — e.g., "What's the latest iPhone?"
-2. **AI evaluates** — Does this need real-time info?
-3. **If yes** → AI responds with `SEARCH: latest iPhone release`
-4. **Bot searches the web** — Using Brave API or DuckDuckGo
-5. **AI answers again** — Using search results to give an accurate, up-to-date response
-
-The search is a two-pass process:
-- **Pass 1**: AI decides if it needs to search (with a special prompt)
-- **Pass 2**: AI answers using web results (results don't pollute your conversation history)
+2. **Bot evaluates search need** — using a lightweight keyword/time heuristic
+3. **If needed, bot searches directly** — Using Brave API or DuckDuckGo
+4. **Bot sends your question + snippets to AI** — in one answer pass
+5. **AI returns an up-to-date response** — grounded in the fetched snippets
 
 You can use `/web off` to disable this entirely, or `/web ddg` to use the free DuckDuckGo engine without any API key.
 
