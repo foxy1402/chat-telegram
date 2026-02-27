@@ -71,13 +71,16 @@ _PROMPT_BASE = (
 _PROMPT_SEARCH_DECISION = (
     "\n\nSEARCH DECISION:\n"
     "You can search the web before answering. Today's date is {date}.\n\n"
-    "If the question needs current or real-time information (prices, news, weather, "
-    "sports scores, recent events, product releases, living people's current status, "
-    "or anything that changes over time), reply with ONLY this line:\n"
-    "SEARCH: <short keywords>\n\n"
-    "Keep the query 2–6 words. No punctuation. No full sentences.\n\n"
-    "Otherwise answer directly — do NOT search for timeless facts, code help, math, "
-    "definitions, creative writing, or anything you already know well."
+    "RULE: Your entire response must be EITHER:\n"
+    "  A) Exactly one line: SEARCH: <2-6 word query>\n"
+    "     Use this when the question needs current/real-time data: prices, news, "
+    "weather, scores, recent events, product releases, living people's status.\n"
+    "  B) A direct answer to the question.\n"
+    "     Use this for timeless facts, code, math, definitions, creative writing.\n\n"
+    "CRITICAL: If you output SEARCH:, do NOT add any other text on that line or after it. "
+    "No apologies. No explanations. No answers. Just: SEARCH: <keywords>\n\n"
+    "Query format: 2–6 words, no punctuation, no full sentences. "
+    "Example: SEARCH: bitcoin price today"
 )
 
 _PROMPT_SEARCH_RESULTS = (
@@ -239,20 +242,27 @@ def _extract_search_query(text: str) -> str:
 def _parse_search_query(response: str) -> Optional[str]:
     """Extract SEARCH: query from AI search-decision response.
 
-    Returns the query string if AI wants to search, or None if it answered directly.
+    Returns clean query string if AI wants to search, or None if it answered directly.
 
-    Handles model quirks:
-    - Quoted queries: SEARCH: "bitcoin price"
-    - Repeated prefix: SEARCH: SEARCH: something
-    - Extra text after the query line (some models append a full answer)
-    - Mixed case: search: / Search:
+    Handles all known model quirks:
+    - Apology glued inline (no newline): 'SEARCH: current US presidentI'm sorry...'
+      Root cause: small models (Cerebras, some Groq) ignore 'ONLY this line' instruction
+      and append a refusal/apology directly after the query without a newline break.
+    - Quoted queries:     SEARCH: "bitcoin price"
+    - Repeated prefix:   SEARCH: SEARCH: something
+    - Answer appended:   SEARCH: bitcoin price\n\nBitcoin is currently trading...
+    - Period-terminated: SEARCH: who is president. I cannot answer.
+    - Mixed case:        search: / Search:
     """
     stripped = response.strip()
     if not stripped.upper().startswith('SEARCH:'):
         return None
 
-    # Take only the first line — some models write SEARCH: query\n\nFull answer here
-    raw = stripped[7:].strip().split('\n')[0].strip()
+    # Take content after SEARCH: prefix
+    raw = stripped[7:].strip()
+
+    # Take only the first line — some models append full answer after newline
+    raw = raw.split('\n')[0].strip()
 
     # Strip surrounding quotes some models add
     for q in ('"', "'"):
@@ -266,8 +276,29 @@ def _parse_search_query(response: str) -> Optional[str]:
         else:
             break
 
-    raw = raw[:150]
-    return raw if raw else None
+    # Cut at inline apology/refusal patterns — models that ignore 'ONLY this line'
+    # sometimes glue the apology directly after the query without any newline.
+    # e.g. "current US presidentI'm sorry, I don't have that information."
+    _APOLOGY_PATTERNS = (
+        r"I'?m sorry", r"I cannot", r"I don'?t", r"I do not",
+        r"I am unable", r"I can'?t", r"Please note", r"Note that",
+        r"However,", r"Unfortunately", r"As of my",
+    )
+    for pat in _APOLOGY_PATTERNS:
+        m = re.search(pat, raw, re.IGNORECASE)
+        if m:
+            raw = raw[:m.start()].strip()
+
+    # Cut at sentence boundary (period/!/?  followed by anything)
+    # Catches: "who is president. I cannot answer." → "who is president"
+    raw = re.sub(r'[.!?].*$', '', raw).strip()
+
+    # Strip trailing punctuation artifacts
+    raw = raw.rstrip('.,!?;:').strip()
+
+    raw = raw[:120]
+    # Require at least 2 chars — a 1-char query is a parsing failure, fall back
+    return raw if len(raw) >= 2 else None
 
 
 def _build_search_context(query: str, snippets: list) -> str:
