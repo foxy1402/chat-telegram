@@ -46,18 +46,11 @@ VALIDATED_MODELS_CACHE = os.path.join(os.path.dirname(__file__), 'validated_mode
 # ============================================================================
 # SYSTEM PROMPT — lean, Telegram-native, ~250 tokens
 #
-# PATCH: Replaced Perplexity prompt loader with a purpose-built prompt.
-# Reasons:
-#   - Perplexity prompt is designed for a pre-search pipeline with indexed
-#     sources. This bot does reactive search with raw snippets — citation
-#     numbers [1][2][3] had no backing sources to reference.
-#   - LaTeX math instructions, ## headers, academic formatting, and
-#     "verbalize your thought process" planning rules all produce bad
-#     Telegram output and cost tokens on every API call.
-#   - The telegram_bot_adaptation override was fighting 3000 tokens of
-#     conflicting base instructions and losing on average.
-#   - Two pre-built variants (base + search) allocated once at startup,
-#     avoiding string concatenation on every request.
+# Three prompt variants, all pre-built at startup:
+#   SYSTEM_PROMPT              — used for direct AI calls (no search)
+#   SYSTEM_PROMPT_WITH_RESULTS — used when search results are provided
+#   _make_search_decision_prompt() — built per-request with today's date
+#                                    injected; used for the 'maybe' AI call
 # ============================================================================
 
 _PROMPT_BASE = (
@@ -75,7 +68,19 @@ _PROMPT_BASE = (
     "- When code is requested, use fenced code blocks with the language name"
 )
 
-_PROMPT_SEARCH_ADDENDUM = (
+_PROMPT_SEARCH_DECISION = (
+    "\n\nSEARCH DECISION:\n"
+    "You can search the web before answering. Today's date is {date}.\n\n"
+    "If the question needs current or real-time information (prices, news, weather, "
+    "sports scores, recent events, product releases, living people's current status, "
+    "or anything that changes over time), reply with ONLY this line:\n"
+    "SEARCH: <short keywords>\n\n"
+    "Keep the query 2–6 words. No punctuation. No full sentences.\n\n"
+    "Otherwise answer directly — do NOT search for timeless facts, code help, math, "
+    "definitions, creative writing, or anything you already know well."
+)
+
+_PROMPT_SEARCH_RESULTS = (
     "\n\nSEARCH RESULTS FORMAT:\n"
     "When web search results are provided, they appear as numbered snippets "
     "(1. Title: text). Use them to answer accurately. "
@@ -83,28 +88,45 @@ _PROMPT_SEARCH_ADDENDUM = (
     "write citation numbers like [1] or [2] — there is no reference list."
 )
 
-# Pre-built at module load — never re-allocated per request
-SYSTEM_PROMPT             = _PROMPT_BASE
-SYSTEM_PROMPT_WITH_SEARCH = _PROMPT_BASE + _PROMPT_SEARCH_ADDENDUM
+# Pre-built at startup — never re-allocated per request
+SYSTEM_PROMPT              = _PROMPT_BASE
+SYSTEM_PROMPT_WITH_RESULTS = _PROMPT_BASE + _PROMPT_SEARCH_RESULTS
 
 
-async def reply_text_safe(message, text: str):
-    """Send Markdown first for better chat UI, then fallback to plain text."""
-    try:
-        await message.reply_text(text, parse_mode='Markdown')
-    except Exception:
-        await message.reply_text(text)
+def _make_search_decision_prompt() -> str:
+    """Build the search-decision system prompt with today's date injected.
+    Called once per 'maybe'-tier message — small cost, big accuracy gain."""
+    import datetime
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    return _PROMPT_BASE + _PROMPT_SEARCH_DECISION.format(date=today)
 
 
 # ============================================================================
-# SEARCH HEURISTIC
+# SEARCH HEURISTIC — 3-tier classification
 #
-# PATCH: Kept the binary direct/no-search decision from esp32_bot v2.
-# The 'maybe' tier (ask AI → wait for SEARCH: → search → answer) costs
-# an extra full API round-trip. _extract_search_query() is good enough to
-# pull a clean query directly from the user's message without asking the AI.
+# WHY THREE TIERS:
+#   Binary heuristic (v2) missed ambiguous queries that need search but have
+#   no obvious keyword signal:
+#     "is Claude better than GPT-4?" → no time/topic keyword → no search → stale
+#     "recommend a good laptop for coding" → no keyword → no search → outdated
+#     "what happened with OpenAI recently?" → vague but clearly needs current info
+#     "best practices for React in 2025?" → year hint but could be answered from knowledge
 #
-# _wants_search() now returns bool. Two tiers: search / no-search.
+#   Three tiers balance accuracy vs API cost:
+#
+#   'no'     — coding, creative, math, greetings, definitions
+#              → skip search entirely, 1 AI call
+#
+#   'direct' — strong time + topic signal together (e.g. "bitcoin price today",
+#              "yesterday's NBA score") → high confidence, extract query
+#              directly, search now, 1 AI call with results
+#
+#   'maybe'  — ambiguous: comparisons, recommendations, vague factual questions,
+#              year-hints without clear no-search signal
+#              → ask AI with search-decision prompt (1 cheap AI call)
+#              → if AI replies SEARCH: <query> → search → 1 final AI call
+#              → if AI answers directly → use that answer, done
+#              Total: 1 extra call only when genuinely ambiguous
 # ============================================================================
 
 _KW_TIME = (
@@ -128,55 +150,76 @@ _KW_NO_SEARCH = (
     'hello', 'hi ', 'hey ', 'thanks', 'thank you', 'bye', 'good morning',
     'tell me a joke', 'poem', 'story', 'essay', 'list',
 )
+# Comparison/recommendation patterns — almost always benefit from web search
+_KW_COMPARE = (
+    ' vs ', ' versus ', 'compare', 'better than', 'best ', 'worst ',
+    'difference between', 'recommend', 'recommendation', 'should i use',
+    'which is better', 'which one', 'alternative to', 'instead of',
+)
 
 
-def _wants_search(text: str) -> bool:
-    """Return True if the message likely needs a web search.
+def _search_tier(text: str) -> str:
+    """Classify message into 'no' / 'direct' / 'maybe' search tier.
 
-    Binary decision — no 'maybe' tier. Any positive search signal triggers
-    a direct search immediately rather than asking the AI first."""
+    Returns:
+        'no'     — skip search, answer directly
+        'direct' — high-confidence search needed, extract query and search now
+        'maybe'  — ambiguous, pass to AI with search-decision prompt
+    """
     low = text.lower()
     length = len(low)
 
+    # Very short = greeting/reaction
     if length < 12:
-        return False
+        return 'no'
 
-    # No-search signals — but check if overridden by time/topic keywords
-    for kw in _KW_NO_SEARCH:
-        if kw in low:
-            for kw2 in _KW_TIME:
-                if kw2 in low:
-                    return True
-            for kw2 in _KW_TOPIC:
-                if kw2 in low:
-                    return True
-            return False
+    has_no_search = any(kw in low for kw in _KW_NO_SEARCH)
+    has_time      = any(kw in low for kw in _KW_TIME)
+    has_topic     = any(kw in low for kw in _KW_TOPIC)
 
-    for kw in _KW_TIME:
-        if kw in low:
-            return True
+    # Strong combined signal → direct search regardless of no-search keywords
+    # (e.g. "what's the latest bitcoin price?" has 'what' which isn't in no-search,
+    #  but "explain the current bitcoin price" has 'explain' which is)
+    if has_time and has_topic:
+        return 'direct'
 
-    for kw in _KW_TOPIC:
-        if kw in low:
-            return True
+    # Definite no-search: coding, creative, math etc — but only if no overriding signal
+    if has_no_search and not has_time and not has_topic:
+        return 'no'
 
-    # Year mention (current ± 1)
+    # Single time or topic signal without a conflicting no-search keyword → maybe
+    if has_time or has_topic:
+        return 'maybe'
+
+    # Comparison / recommendation patterns → let AI decide
+    if any(kw in low for kw in _KW_COMPARE):
+        return 'maybe'
+
+    # Year mention that might need current context
     import datetime
     year = datetime.datetime.now().year
-    for y in (str(year - 1), str(year), str(year + 1)):
-        if y in low:
-            return True
+    if any(str(y) in low for y in (year - 1, year, year + 1)):
+        return 'maybe'
 
-    # Question patterns that likely need live data
+    # Factual who/where/what/how-much questions likely need live data
     if '?' in low and length > 20:
-        if 'who ' in low or 'how much' in low or 'how many' in low or 'where ' in low:
-            return True
+        if any(kw in low for kw in ('who ', 'where ', 'when ', 'how much', 'how many', 'what is the')):
+            return 'maybe'
 
-    return False
+    # No-search signals without override
+    if has_no_search:
+        return 'no'
+
+    # Default: if it's a question of reasonable length, let AI decide
+    if '?' in low and length > 30:
+        return 'maybe'
+
+    return 'no'
 
 
 def _extract_search_query(text: str) -> str:
-    """Strip question prefixes and return a clean search query (max 120 chars)."""
+    """Strip question prefixes and return a clean search query (max 120 chars).
+    Used on the 'direct' tier where we don't ask the AI to reformulate."""
     low = text.strip()
     for prefix in (
         'what is the', 'what are the', 'what is', 'what are',
@@ -193,11 +236,42 @@ def _extract_search_query(text: str) -> str:
     return low[:120] if low else text[:120]
 
 
-def _build_search_context(query: str, snippets: list) -> str:
-    """Format search results as numbered snippets the model can reference naturally.
+def _parse_search_query(response: str) -> Optional[str]:
+    """Extract SEARCH: query from AI search-decision response.
 
-    Includes today's date so the model has temporal context without needing
-    a bloated search-aware system prompt injected on every request."""
+    Returns the query string if AI wants to search, or None if it answered directly.
+
+    Handles model quirks:
+    - Quoted queries: SEARCH: "bitcoin price"
+    - Repeated prefix: SEARCH: SEARCH: something
+    - Extra text after the query line (some models append a full answer)
+    - Mixed case: search: / Search:
+    """
+    stripped = response.strip()
+    if not stripped.upper().startswith('SEARCH:'):
+        return None
+
+    # Take only the first line — some models write SEARCH: query\n\nFull answer here
+    raw = stripped[7:].strip().split('\n')[0].strip()
+
+    # Strip surrounding quotes some models add
+    for q in ('"', "'"):
+        if len(raw) > 2 and raw[0] == q and raw[-1] == q:
+            raw = raw[1:-1].strip()
+
+    # Strip repeated SEARCH: prefix (rare but happens)
+    for _ in range(3):
+        if raw.upper().startswith('SEARCH:'):
+            raw = raw[7:].strip()
+        else:
+            break
+
+    raw = raw[:150]
+    return raw if raw else None
+
+
+def _build_search_context(query: str, snippets: list) -> str:
+    """Format search results as numbered snippets with today's date for temporal grounding."""
     import datetime
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     parts = [f"Today is {today}. Web search results for '{query}':"]
@@ -208,27 +282,30 @@ def _build_search_context(query: str, snippets: list) -> str:
 
 # ============================================================================
 # HISTORY UTILITIES
-#
-# PATCH: Replaced asymmetric tail-slice trim with pair-based eviction.
-# Old code: history[-MAX_HISTORY_MESSAGES:] — could orphan a user message
-# without its assistant response, or keep an assistant response whose user
-# message was evicted. This confuses the model on subsequent turns.
-# New code: always removes from the front in user+assistant pairs.
-# MAX_HISTORY_MESSAGES should be even (default 20 = 10 complete exchanges).
 # ============================================================================
 
 def _trim_history(history: list) -> list:
     """Trim history to MAX_HISTORY_MESSAGES keeping complete user/assistant pairs.
-
-    Always removes the oldest pair (2 messages) at a time so the model
-    never sees a dangling half-exchange."""
+    Always removes the oldest pair (2 messages) so the model never sees a
+    dangling half-exchange."""
     while len(history) > MAX_HISTORY_MESSAGES:
         if len(history) >= 2:
-            history.pop(0)  # oldest user message
-            history.pop(0)  # its assistant response
+            history.pop(0)
+            history.pop(0)
         else:
             history.pop(0)
     return history
+
+
+async def reply_text_safe(message, text: str):
+    """Send Markdown first for better chat UI, fallback to plain text on parse error."""
+    try:
+        await message.reply_text(text, parse_mode='Markdown')
+    except Exception:
+        try:
+            await message.reply_text(text)
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
 
 
 # ============================================================================
@@ -344,7 +421,7 @@ class GroqProvider(AIProvider):
             chat_models = []
             for model in models_response.data:
                 if model.active and hasattr(model, 'id'):
-                    chat_models.append({"id": model.id, "name": self._format_model_name(model.id)})
+                    chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
             chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
             self._cached_models = chat_models
             logger.info(f"✅ Groq: Detected {len(chat_models)} available models")
@@ -352,9 +429,6 @@ class GroqProvider(AIProvider):
         except Exception as e:
             logger.warning(f"⚠️ Groq: Could not fetch models: {e}")
             return self._get_fallback_models()
-
-    def _format_model_name(self, model_id: str) -> str:
-        return model_id.replace('-', ' ').title()
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -396,8 +470,7 @@ class GeminiProvider(AIProvider):
             role = "user" if msg["role"] == "user" else "model"
             chat_history.append({"role": role, "parts": [msg["content"]]})
         chat = gen_model.start_chat(history=chat_history)
-        response = chat.send_message(messages[-1]["content"])
-        return response.text
+        return chat.send_message(messages[-1]["content"]).text
 
     def get_available_models(self) -> List[Dict[str, str]]:
         if self._cached_models:
@@ -410,10 +483,8 @@ class GeminiProvider(AIProvider):
                 model_id = model.name.replace('models/', '')
                 if any(x in model_id.lower() for x in ['vision', 'embedding', 'aqa']):
                     continue
-                chat_models.append({
-                    "id": model_id,
-                    "name": self._format_model_name(model_id, model)
-                })
+                name = model.display_name if hasattr(model, 'display_name') else model_id.replace('-', ' ').title()
+                chat_models.append({"id": model_id, "name": name})
             chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
             self._cached_models = chat_models
             logger.info(f"✅ Gemini: Detected {len(chat_models)} available models")
@@ -421,14 +492,6 @@ class GeminiProvider(AIProvider):
         except Exception as e:
             logger.warning(f"⚠️ Gemini: Could not fetch models: {e}")
             return self._get_fallback_models()
-
-    def _format_model_name(self, model_id: str, model_obj=None) -> str:
-        if model_obj and hasattr(model_obj, 'display_name'):
-            return model_obj.display_name
-        name = model_id.replace('gemini-', 'Gemini ').replace('-', ' ').title()
-        if 'exp' in model_id.lower():
-            name += " (Experimental)"
-        return name
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -480,17 +543,15 @@ class OpenRouterProvider(AIProvider):
                 model_id = model.get('id', '')
                 pricing = model.get('pricing', {})
                 context_length = model.get('context_length', 0)
-                has_free_suffix = ':free' in model_id.lower()
-                prompt_str = str(pricing.get('prompt', '')) if pricing.get('prompt') is not None else ''
-                completion_str = str(pricing.get('completion', '')) if pricing.get('completion') is not None else ''
-                has_zero_pricing = (prompt_str in ["0", "0.0", "0.00"] and
-                                    completion_str in ["0", "0.0", "0.00"])
-                if has_free_suffix and context_length > 0 and has_zero_pricing:
-                    free_models.append({
-                        "id": model_id,
-                        "name": self._format_model_name(model),
-                        "context": context_length
-                    })
+                if ':free' not in model_id.lower() or context_length <= 0:
+                    continue
+                ps = str(pricing.get('prompt', ''))
+                cs = str(pricing.get('completion', ''))
+                if ps not in ["0", "0.0", "0.00"] or cs not in ["0", "0.0", "0.00"]:
+                    continue
+                name = model.get('name', model_id)
+                name = name.replace(' (free)', '').replace(' (Free)', '') + " (Free)"
+                free_models.append({"id": model_id, "name": name, "context": context_length})
             free_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
             self._cached_models = free_models[:15]
             logger.info(f"✅ OpenRouter: Detected {len(self._cached_models)} free models")
@@ -498,13 +559,6 @@ class OpenRouterProvider(AIProvider):
         except Exception as e:
             logger.warning(f"⚠️ OpenRouter: Could not fetch models: {e}")
             return self._get_fallback_models()
-
-    def _format_model_name(self, model_obj: dict) -> str:
-        name = model_obj.get('name', model_obj.get('id', 'Unknown'))
-        model_id = model_obj.get('id', '')
-        if ':free' in model_id.lower():
-            name = name.replace(' (free)', '').replace(' (Free)', '') + " (Free)"
-        return name
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -548,7 +602,7 @@ class CerebrasProvider(AIProvider):
             chat_models = []
             for model in self.client.models.list().data:
                 if hasattr(model, 'id'):
-                    chat_models.append({"id": model.id, "name": self._format_model_name(model.id)})
+                    chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
             chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
             self._cached_models = chat_models
             logger.info(f"✅ Cerebras: Detected {len(chat_models)} available models")
@@ -556,9 +610,6 @@ class CerebrasProvider(AIProvider):
         except Exception as e:
             logger.warning(f"⚠️ Cerebras: Could not fetch models: {e}")
             return self._get_fallback_models()
-
-    def _format_model_name(self, model_id: str) -> str:
-        return model_id.replace('-', ' ').title()
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -599,31 +650,26 @@ class NvidiaProvider(AIProvider):
         if not any(msg.get('role') == 'system' for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-        should_use_thinking = enable_thinking and self.supports_thinking(model)
-
-        if should_use_thinking:
+        if enable_thinking and self.supports_thinking(model):
             response = self.client.chat.completions.create(
                 messages=chat_messages, model=model,
                 temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
                 extra_body={"chat_template_kwargs": {"thinking": True}},
                 stream=True
             )
-            reasoning_parts = []
-            content_parts = []
+            reasoning_parts, content_parts = [], []
             for chunk in response:
                 if not getattr(chunk, "choices", None) or len(chunk.choices) == 0:
                     continue
                 delta = chunk.choices[0].delta
-                reasoning = getattr(delta, "reasoning_content", None)
-                if reasoning:
-                    reasoning_parts.append(reasoning)
+                if getattr(delta, "reasoning_content", None):
+                    reasoning_parts.append(delta.reasoning_content)
                 if getattr(delta, "content", None) is not None:
                     content_parts.append(delta.content)
-            full_response = ""
+            full = ""
             if reasoning_parts:
-                full_response = "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n"
-            full_response += "".join(content_parts)
-            return full_response
+                full = "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n"
+            return full + "".join(content_parts)
         else:
             response = self.client.chat.completions.create(
                 messages=chat_messages, model=model,
@@ -675,35 +721,30 @@ class ProviderManager:
                 logger.info("✅ Groq provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Groq: {e}")
-
         if GEMINI_API_KEY:
             try:
                 self.providers['gemini'] = GeminiProvider(GEMINI_API_KEY)
                 logger.info("✅ Gemini provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Gemini: {e}")
-
         if OPENROUTER_API_KEY:
             try:
                 self.providers['openrouter'] = OpenRouterProvider(OPENROUTER_API_KEY)
                 logger.info("✅ OpenRouter provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize OpenRouter: {e}")
-
         if CEREBRAS_API_KEY:
             try:
                 self.providers['cerebras'] = CerebrasProvider(CEREBRAS_API_KEY)
                 logger.info("✅ Cerebras provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Cerebras: {e}")
-
         if NVIDIA_API_KEY:
             try:
                 self.providers['nvidia'] = NvidiaProvider(NVIDIA_API_KEY)
                 logger.info("✅ NVIDIA provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize NVIDIA: {e}")
-
         if not self.providers:
             raise ValueError("No AI providers available! Set at least one API key.")
 
@@ -729,10 +770,7 @@ class ProviderManager:
             logger.info(f"  {name}: {len(models)} models")
 
 
-# Initialize provider manager
 provider_manager = ProviderManager()
-
-# Store user sessions (in-memory, resets on restart)
 user_sessions: Dict[str, Dict] = {}
 
 
@@ -760,6 +798,17 @@ def is_user_allowed(user_id: str) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
+def _resolve_provider(session: Dict):
+    """Return (provider_name, provider) — auto-corrects stale provider."""
+    name = session["provider"]
+    prov = provider_manager.get_provider(name)
+    if not prov:
+        name = provider_manager.get_default_provider()
+        session["provider"] = name
+        prov = provider_manager.get_provider(name)
+    return name, prov
+
+
 # ============================================================================
 # MODEL VALIDATION CACHE
 # ============================================================================
@@ -780,26 +829,23 @@ def save_validated_models(validated: Dict):
     except Exception as e:
         logger.error(f"Could not save validated models cache: {e}")
 
-def get_validated_models(provider_name: str) -> List[str]:
-    validated = load_validated_models()
-    provider_data = validated.get(provider_name, {})
-    if isinstance(provider_data, list):
-        return provider_data
-    return provider_data.get('working', [])
-
-def get_failed_models(provider_name: str) -> List[str]:
-    validated = load_validated_models()
-    provider_data = validated.get(provider_name, {})
-    if isinstance(provider_data, dict):
-        return provider_data.get('failed', [])
-    return []
-
-def add_validated_model(provider_name: str, model_id: str):
-    validated = load_validated_models()
+def _ensure_provider_entry(validated: Dict, provider_name: str) -> Dict:
     if provider_name not in validated:
         validated[provider_name] = {'working': [], 'failed': []}
     if isinstance(validated[provider_name], list):
         validated[provider_name] = {'working': validated[provider_name], 'failed': []}
+    return validated
+
+def get_validated_models(provider_name: str) -> List[str]:
+    d = load_validated_models().get(provider_name, {})
+    return d.get('working', []) if isinstance(d, dict) else d
+
+def get_failed_models(provider_name: str) -> List[str]:
+    d = load_validated_models().get(provider_name, {})
+    return d.get('failed', []) if isinstance(d, dict) else []
+
+def add_validated_model(provider_name: str, model_id: str):
+    validated = _ensure_provider_entry(load_validated_models(), provider_name)
     if model_id not in validated[provider_name]['working']:
         validated[provider_name]['working'].append(model_id)
         if model_id in validated[provider_name]['failed']:
@@ -807,11 +853,7 @@ def add_validated_model(provider_name: str, model_id: str):
         save_validated_models(validated)
 
 def add_failed_model(provider_name: str, model_id: str):
-    validated = load_validated_models()
-    if provider_name not in validated:
-        validated[provider_name] = {'working': [], 'failed': []}
-    if isinstance(validated[provider_name], list):
-        validated[provider_name] = {'working': validated[provider_name], 'failed': []}
+    validated = _ensure_provider_entry(load_validated_models(), provider_name)
     if model_id not in validated[provider_name]['failed']:
         validated[provider_name]['failed'].append(model_id)
         save_validated_models(validated)
@@ -831,8 +873,7 @@ def clear_validated_models(provider_name: Optional[str] = None):
 # ============================================================================
 
 def _strip_tags(html_str: str) -> str:
-    out = []
-    in_tag = False
+    out, in_tag = [], False
     for c in html_str:
         if c == '<':   in_tag = True
         elif c == '>': in_tag = False
@@ -843,10 +884,11 @@ def _brave_search_sync(query: str) -> list:
     if not BRAVE_API_KEY:
         return []
     q = urllib.parse.quote_plus(query)
-    url = f"https://api.search.brave.com/res/v1/web/search?q={q}&count={MAX_SEARCH_RESULTS}"
     try:
-        r = requests.get(url, headers={"Accept": "application/json",
-                                        "X-Subscription-Token": BRAVE_API_KEY}, timeout=10)
+        r = requests.get(
+            f"https://api.search.brave.com/res/v1/web/search?q={q}&count={MAX_SEARCH_RESULTS}",
+            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
+            timeout=10)
         r.raise_for_status()
         snippets = []
         for item in r.json().get("web", {}).get("results", []):
@@ -867,29 +909,25 @@ def _duckduckgo_search_sync(query: str) -> list:
                          headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         r.raise_for_status()
         html_text = r.text
-        snippets = []
-        pos = 0
+        snippets, pos = [], 0
         while len(snippets) < MAX_SEARCH_RESULTS:
             pos = html_text.find('class="result__a"', pos)
             if pos == -1: break
             tag_end = html_text.find('>', pos)
             if tag_end == -1: break
-            title_start = tag_end + 1
-            title_end = html_text.find('</a>', title_start)
+            title_end = html_text.find('</a>', tag_end + 1)
             if title_end == -1: break
-            title = _strip_tags(html_text[title_start:title_end])
+            title = _strip_tags(html_text[tag_end + 1:title_end])
             snip_pos    = html_text.find('class="result__snippet', pos)
             next_result = html_text.find('class="result__a"', title_end + 1)
             desc = ""
             if snip_pos != -1 and (next_result == -1 or snip_pos < next_result):
-                stag_end = html_text.find('>', snip_pos)
-                if stag_end != -1:
-                    snip_start = stag_end + 1
-                    snip_end = html_text.find('</a>', snip_start)
-                    if snip_end == -1:
-                        snip_end = html_text.find('</td>', snip_start)
-                    if snip_end != -1:
-                        desc = _strip_tags(html_text[snip_start:snip_end])[:MAX_SNIPPET_LEN]
+                se = html_text.find('>', snip_pos)
+                if se != -1:
+                    end = html_text.find('</a>', se + 1)
+                    if end == -1: end = html_text.find('</td>', se + 1)
+                    if end != -1:
+                        desc = _strip_tags(html_text[se + 1:end])[:MAX_SNIPPET_LEN]
             if title:
                 snippets.append(f"{title}: {desc}")
             pos = title_end + 1
@@ -915,10 +953,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     session = get_user_session(user_id)
-    provider = provider_manager.get_provider(session["provider"])
-    if not provider:
-        session["provider"] = provider_manager.get_default_provider()
-        provider = provider_manager.get_provider(session["provider"])
+    _, provider = _resolve_provider(session)
     web_status = "ON" if session.get("web_search") else "OFF"
     await update.message.reply_text(
         f"🤖 Hello! I'm your Multi-Provider AI assistant.\n\n"
@@ -993,10 +1028,7 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     session = get_user_session(user_id)
     if not context.args:
-        current = provider_manager.get_provider(session["provider"])
-        if not current:
-            session["provider"] = provider_manager.get_default_provider()
-            current = provider_manager.get_provider(session["provider"])
+        _, current = _resolve_provider(session)
         await update.message.reply_text(
             f"📡 *Current:* {current.get_name()}\n"
             f"🔧 *Available:* {', '.join(provider_manager.list_providers())}\n\n"
@@ -1025,12 +1057,7 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     session = get_user_session(user_id)
-    provider_name = session["provider"]
-    provider = provider_manager.get_provider(provider_name)
-    if not provider:
-        session["provider"] = provider_manager.get_default_provider()
-        provider_name = session["provider"]
-        provider = provider_manager.get_provider(provider_name)
+    provider_name, provider = _resolve_provider(session)
     show_all = len(context.args) > 0 and context.args[0].lower() == 'all'
     if show_all:
         await update.message.reply_text("🔄 Fetching all models from API...")
@@ -1052,8 +1079,7 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title_suffix = " (Verified)"
         footer_note = f"\n\n💡 Use `/models all` to see all {len(all_models)} models"
     current_model = session["models"].get(provider_name) or provider.get_default_model()
-    max_per_msg = 20
-    chunks = [models[i:i+max_per_msg] for i in range(0, len(models), max_per_msg)]
+    chunks = [models[i:i+20] for i in range(0, len(models), 20)]
     for idx, chunk in enumerate(chunks, 1):
         model_list = "\n".join([
             f"• `{m['id']}`" + (" ✓" if m['id'] == current_model else "")
@@ -1061,8 +1087,7 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         part = f" (Part {idx}/{len(chunks)})" if len(chunks) > 1 else ""
         await update.message.reply_text(
-            f"🤖 *{provider.get_name()}{title_suffix}{part}:*\n\n"
-            f"{model_list}"
+            f"🤖 *{provider.get_name()}{title_suffix}{part}:*\n\n{model_list}"
             + (f"\n\nCurrent: `{current_model}`{footer_note}\n\nUse `/model <id>` to switch."
                if idx == len(chunks) else ""),
             parse_mode='Markdown'
@@ -1074,12 +1099,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     session = get_user_session(user_id)
-    provider_name = session["provider"]
-    provider = provider_manager.get_provider(provider_name)
-    if not provider:
-        session["provider"] = provider_manager.get_default_provider()
-        provider_name = session["provider"]
-        provider = provider_manager.get_provider(provider_name)
+    provider_name, provider = _resolve_provider(session)
     if not context.args:
         current = session["models"].get(provider_name) or provider.get_default_model()
         await update.message.reply_text(
@@ -1108,12 +1128,7 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     session = get_user_session(user_id)
-    provider_name = session["provider"]
-    provider = provider_manager.get_provider(provider_name)
-    if not provider:
-        session["provider"] = provider_manager.get_default_provider()
-        provider_name = session["provider"]
-        provider = provider_manager.get_provider(provider_name)
+    provider_name, provider = _resolve_provider(session)
     models = provider.get_available_models()
     already_validated  = get_validated_models(provider_name)
     permanently_failed = get_failed_models(provider_name)
@@ -1138,10 +1153,7 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ All models already validated!\n\nUse `/verified` to see them.")
         return
     validated = list(already_validated)
-    newly_validated = []
-    failed_not_available = []
-    failed_rate_limit = []
-    failed_unknown = []
+    newly_validated, failed_na, failed_rl, failed_unk = [], [], [], []
     for idx, model_info in enumerate(models_to_test, 1):
         model_id = model_info['id']
         if idx % 5 == 0 or idx == 1:
@@ -1150,20 +1162,18 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         success, error_type = provider.test_model(model_id)
         if success:
-            validated.append(model_id)
-            newly_validated.append(model_id)
+            validated.append(model_id); newly_validated.append(model_id)
             add_validated_model(provider_name, model_id)
         elif error_type == 'not_available':
-            failed_not_available.append(model_id)
-            add_failed_model(provider_name, model_id)
+            failed_na.append(model_id); add_failed_model(provider_name, model_id)
         elif error_type == 'rate_limit':
-            failed_rate_limit.append(model_id)
+            failed_rl.append(model_id)
         else:
-            failed_unknown.append(model_id)
+            failed_unk.append(model_id)
         if idx < len(models_to_test):
             await asyncio.sleep(2)
-    total_failed = len(failed_not_available) + len(failed_rate_limit) + len(failed_unknown)
-    success_rate = (len(newly_validated) / len(models_to_test) * 100) if models_to_test else 0
+    total_failed = len(failed_na) + len(failed_rl) + len(failed_unk)
+    rate = (len(newly_validated) / len(models_to_test) * 100) if models_to_test else 0
     msg = (
         f"✅ *Validation Complete*\n\n"
         f"• Tested: {len(models_to_test)}\n"
@@ -1173,15 +1183,11 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if total_failed > 0:
         msg += (
             f"\n*Failure breakdown:*\n"
-            f"• 🚫 Not available: {len(failed_not_available)} (cached)\n"
-            f"• ⏱️ Rate limited: {len(failed_rate_limit)} (retry later)\n"
-            f"• ❓ Unknown: {len(failed_unknown)}\n"
+            f"• 🚫 Not available: {len(failed_na)} (cached)\n"
+            f"• ⏱️ Rate limited: {len(failed_rl)} (retry later)\n"
+            f"• ❓ Unknown: {len(failed_unk)}\n"
         )
-    msg += (
-        f"\n• Success rate: {success_rate:.1f}%\n\n"
-        f"📦 *Total validated: {len(validated)}*\n\n"
-        f"Use `/verified` to see working models!"
-    )
+    msg += f"\n• Success rate: {rate:.1f}%\n\n📦 *Total validated: {len(validated)}*\n\nUse `/verified` to see working models!"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def verified_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1190,12 +1196,7 @@ async def verified_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     session = get_user_session(user_id)
-    provider_name = session["provider"]
-    provider = provider_manager.get_provider(provider_name)
-    if not provider:
-        session["provider"] = provider_manager.get_default_provider()
-        provider_name = session["provider"]
-        provider = provider_manager.get_provider(provider_name)
+    provider_name, provider = _resolve_provider(session)
     validated_ids = get_validated_models(provider_name)
     if not validated_ids:
         await update.message.reply_text(
@@ -1211,8 +1212,7 @@ async def verified_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for m in validated_models
     ])
     await update.message.reply_text(
-        f"✅ *Verified Models — {provider.get_name()}:*\n\n"
-        f"{model_list}\n\n"
+        f"✅ *Verified Models — {provider.get_name()}:*\n\n{model_list}\n\n"
         f"Current: `{current_model}`\n\nUse `/model <id>` to switch.",
         parse_mode='Markdown'
     )
@@ -1223,12 +1223,7 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     session = get_user_session(user_id)
-    provider_name = session["provider"]
-    provider = provider_manager.get_provider(provider_name)
-    if not provider:
-        session["provider"] = provider_manager.get_default_provider()
-        provider_name = session["provider"]
-        provider = provider_manager.get_provider(provider_name)
+    provider_name, provider = _resolve_provider(session)
     if not context.args:
         state = "enabled" if session.get("thinking_enabled", False) else "disabled"
         await update.message.reply_text(
@@ -1241,17 +1236,12 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["thinking_enabled"] = True
         if provider_name == 'nvidia':
             current_model = session["models"].get(provider_name) or provider.get_default_model()
-            if provider.supports_thinking(current_model):
-                await update.message.reply_text(
-                    f"✅ *Thinking mode enabled!* 💭\n\n`{current_model}` supports thinking.",
-                    parse_mode='Markdown'
-                )
-            else:
-                await update.message.reply_text(
-                    f"⚠️ *Thinking mode enabled*, but `{current_model}` doesn't support it.\n"
-                    f"Switch to a model with 💭 to use thinking.",
-                    parse_mode='Markdown'
-                )
+            ok = provider.supports_thinking(current_model)
+            await update.message.reply_text(
+                f"✅ *Thinking mode enabled!* 💭\n\n"
+                f"`{current_model}` {'supports' if ok else 'does NOT support'} thinking.",
+                parse_mode='Markdown'
+            )
         else:
             await update.message.reply_text(
                 f"✅ *Thinking mode enabled!*\n\nOnly NVIDIA supports thinking. "
@@ -1270,12 +1260,7 @@ async def clearvalidation_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     session = get_user_session(user_id)
-    provider_name = session["provider"]
-    provider = provider_manager.get_provider(provider_name)
-    if not provider:
-        session["provider"] = provider_manager.get_default_provider()
-        provider_name = session["provider"]
-        provider = provider_manager.get_provider(provider_name)
+    provider_name, provider = _resolve_provider(session)
     clear_validated_models(provider_name)
     await update.message.reply_text(
         f"🗑️ Cleared validation cache for {provider.get_name()}!\n\nRun `/validate` to re-test."
@@ -1326,25 +1311,28 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
-# MESSAGE HANDLER
+# MESSAGE HANDLER — 3-tier search loop
 #
-# PATCH SUMMARY vs original:
-#   1. Removed 2-pass LLM search loop (Pass 1 ask AI → wait for SEARCH: →
-#      Pass 2). Replaced with binary heuristic: _wants_search() decides
-#      immediately, _extract_search_query() pulls the query from user text.
-#      Saves one full API round-trip per search-eligible message.
+# FLOW:
 #
-#   2. Search context built via _build_search_context() — numbered snippets
-#      with today's date. Model can reference results naturally without
-#      fabricating [1][2] citation numbers.
+#   tier='no':
+#     user msg → [1 AI call] → reply
 #
-#   3. History trimmed via _trim_history() (pair-based) instead of asymmetric
-#      tail-slice. No more orphaned user/assistant messages.
+#   tier='direct':
+#     user msg → extract_query → web_search → [1 AI call with results] → reply
 #
-#   4. SYSTEM_PROMPT_WITH_SEARCH used for search path — pre-built at startup,
-#      not re-concatenated on every request.
+#   tier='maybe':
+#     user msg → [1 AI call with search-decision prompt]
+#       → AI replies "SEARCH: <query>" → web_search → [1 AI call with results] → reply
+#       → AI replies directly          → use that answer → reply
 #
-#   5. History rollback on exception preserved from original (was already good).
+# UX improvements vs v2:
+#   - Typing indicator sent before EACH blocking operation (search + AI calls)
+#   - Empty/whitespace response caught with user-friendly fallback
+#   - Search tier logged for easier debugging
+#   - _parse_search_query() handles all known model quirks (quoted, repeated SEARCH:, etc.)
+#   - History rollback on any exception (was already present, kept)
+#   - Today's date injected into search-decision prompt via _make_search_decision_prompt()
 # ============================================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1362,40 +1350,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.chat.send_action(action="typing")
 
-        provider_name = session["provider"]
-        provider = provider_manager.get_provider(provider_name)
-        if not provider:
-            session["provider"] = provider_manager.get_default_provider()
-            provider_name = session["provider"]
-            provider = provider_manager.get_provider(provider_name)
-
-        current_model    = session["models"].get(provider_name)  # None = provider default
+        provider_name, provider = _resolve_provider(session)
+        current_model    = session["models"].get(provider_name)   # None = provider default
         thinking_enabled = session.get("thinking_enabled", False)
         web_on           = session.get("web_search", True)
 
-        # Add user message to history (popped on exception below)
+        # Append user message (popped on error below)
         session["history"].append({"role": "user", "content": user_message})
 
-        # ── Decide search strategy ───────────────────────────────────────
-        do_search = web_on and _wants_search(user_message)
-        logger.info(f"[Bot] user={user_id} do_search={do_search} provider={provider_name}")
+        tier = _search_tier(user_message) if web_on else 'no'
+        logger.info(f"[Bot] user={user_id} tier={tier} provider={provider_name}")
 
-        if do_search:
-            # ── SEARCH PATH ─────────────────────────────────────────────
+        bot_response = ""
+
+        # ── TIER: NO SEARCH ───────────────────────────────────────────────
+        if tier == 'no':
+            bot_response = provider.chat(
+                messages=session["history"],
+                model=current_model,
+                enable_thinking=thinking_enabled
+            ) or ""
+
+        # ── TIER: DIRECT SEARCH ───────────────────────────────────────────
+        elif tier == 'direct':
             query  = _extract_search_query(user_message)
             engine = session.get("search_engine", "duckduckgo")
-            logger.info(f"[Bot] Searching ({engine}): '{query}'")
+            logger.info(f"[Bot] Direct search ({engine}): '{query}'")
 
             await update.message.chat.send_action(action="typing")
             snippets = await web_search(query, engine)
 
             if snippets:
                 ctx = _build_search_context(query, snippets)
-
-                # Build search messages: history (minus just-added user msg)
-                # + combined user message with context appended
                 search_msgs = session["history"][:-1].copy()
                 search_msgs.append({"role": "user", "content": user_message + "\n\n" + ctx})
+                # Use search-results system prompt
+                search_msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS})
 
                 await update.message.chat.send_action(action="typing")
                 bot_response = provider.chat(
@@ -1404,65 +1394,101 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     enable_thinking=thinking_enabled
                 ) or ""
             else:
-                # Search returned nothing — fall through to plain AI call
-                logger.warning(f"[Bot] Search returned no results, falling back to direct AI call")
+                logger.warning("[Bot] Direct search empty, falling back to direct AI call")
                 bot_response = provider.chat(
                     messages=session["history"],
                     model=current_model,
                     enable_thinking=thinking_enabled
                 ) or ""
-        else:
-            # ── DIRECT AI PATH ───────────────────────────────────────────
-            bot_response = provider.chat(
-                messages=session["history"],
-                model=current_model,
-                enable_thinking=thinking_enabled
+
+        # ── TIER: MAYBE — let AI decide ───────────────────────────────────
+        else:  # 'maybe'
+            decision_prompt = _make_search_decision_prompt()
+
+            # Build decision messages: search-decision system prompt + history
+            # (no system message already in history — _trim_history never adds one)
+            decision_msgs = [{"role": "system", "content": decision_prompt}]
+            decision_msgs += [m for m in session["history"] if m.get("role") != "system"]
+
+            await update.message.chat.send_action(action="typing")
+            ai_decision = provider.chat(
+                messages=decision_msgs,
+                model=current_model
             ) or ""
 
-        if not bot_response.strip():
-            bot_response = "⚠️ The AI returned an empty response. Try again or switch models."
+            search_query = _parse_search_query(ai_decision)
 
-        # ── Update history ───────────────────────────────────────────────
+            if search_query:
+                # AI wants to search
+                engine = session.get("search_engine", "duckduckgo")
+                logger.info(f"[Bot] AI-requested search ({engine}): '{search_query}'")
+
+                await update.message.chat.send_action(action="typing")
+                snippets = await web_search(search_query, engine)
+
+                if snippets:
+                    ctx = _build_search_context(search_query, snippets)
+                    search_msgs = session["history"][:-1].copy()
+                    search_msgs.append({"role": "user", "content": user_message + "\n\n" + ctx})
+                    search_msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS})
+
+                    await update.message.chat.send_action(action="typing")
+                    bot_response = provider.chat(
+                        messages=search_msgs,
+                        model=current_model,
+                        enable_thinking=thinking_enabled
+                    ) or ""
+                else:
+                    # Search found nothing — re-ask AI without search context
+                    logger.warning("[Bot] Maybe-search empty, re-querying AI directly")
+                    bot_response = provider.chat(
+                        messages=session["history"],
+                        model=current_model,
+                        enable_thinking=thinking_enabled
+                    ) or ""
+            else:
+                # AI answered directly on the decision call — use that answer
+                bot_response = ai_decision
+
+        # ── Fallback for empty response ────────────────────────────────────
+        if not bot_response.strip():
+            bot_response = "⚠️ The AI returned an empty response. Try again or use `/model` to switch models."
+
+        # ── Update history ─────────────────────────────────────────────────
         session["history"].append({"role": "assistant", "content": bot_response})
         _trim_history(session["history"])
 
-        # ── Send response (handle 4096 char limit) ───────────────────────
+        # ── Send response (handle 4096 char limit) ─────────────────────────
         if len(bot_response) <= MAX_MESSAGE_LENGTH:
             await reply_text_safe(update.message, bot_response)
         else:
             HEADER_RESERVE = 25
             chunk_limit = MAX_MESSAGE_LENGTH - HEADER_RESERVE
-            chunks = []
-            current_chunk = ""
+            chunks, current_chunk = [], ""
             for line in bot_response.split('\n'):
                 if len(line) > chunk_limit:
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                        current_chunk = ""
+                    if current_chunk: chunks.append(current_chunk); current_chunk = ""
                     for j in range(0, len(line), chunk_limit):
                         chunks.append(line[j:j + chunk_limit])
                     continue
                 if len(current_chunk) + len(line) + 1 > chunk_limit:
-                    if current_chunk:
-                        chunks.append(current_chunk)
+                    if current_chunk: chunks.append(current_chunk)
                     current_chunk = line
                 else:
                     current_chunk = (current_chunk + '\n' + line) if current_chunk else line
-            if current_chunk:
-                chunks.append(current_chunk)
+            if current_chunk: chunks.append(current_chunk)
             for i, chunk in enumerate(chunks, 1):
                 header = f"📄 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
                 await reply_text_safe(update.message, header + chunk)
 
     except Exception as e:
         logger.error(f"Error in handle_message: {e}", exc_info=True)
-        # Roll back the orphaned user message
+        # Roll back orphaned user message
         if session["history"] and session["history"][-1].get("role") == "user":
             session["history"].pop()
-        prov = provider_manager.get_provider(session.get("provider", ""))
-        prov_label = prov.get_name() if prov else session.get("provider", "unknown")
+        _, prov = _resolve_provider(session)
         await update.message.reply_text(
-            f"❌ Error with {prov_label}: {str(e)}\n\n"
+            f"❌ Error with {prov.get_name()}: {str(e)}\n\n"
             f"Try:\n• `/clear` to reset conversation\n• `/provider` to switch provider"
         )
 
