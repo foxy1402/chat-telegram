@@ -129,6 +129,7 @@ def _skip_search_decision(text: str) -> bool:
 
 _APOLOGY_PATTERNS = (
     r"SEARCH:",                                           # doubled output (Cerebras quirk)
+    r"NOSEARCH",                                          # glued NOSEARCH suffix (Cerebras quirk)
     r"I['\u2019]?m sorry", r"I cannot", r"I don['\u2019]?t", r"I do not",
     r"I am unable", r"I can['\u2019]?t", r"Please note", r"Note that",
     r"However,", r"Unfortunately", r"As of my",

@@ -195,6 +195,7 @@ def _parse_search_query(response):
     # Using pure str.find() — no ure import needed, saves ~2KB RAM on ESP32.
     _CUTS = (
         "search:",                                            # doubled output quirk
+        "nosearch",                                           # glued NOSEARCH suffix (Cerebras quirk)
         "i\u2019m sorry", "i'm sorry", "i am sorry",         # Unicode + ASCII apostrophe variants
         "i cannot", "i don\u2019t", "i don't", "i do not",
         "i am unable", "i can\u2019t", "i can't",
