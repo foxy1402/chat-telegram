@@ -3,6 +3,7 @@ import re
 import logging
 import json
 import asyncio
+import datetime
 import urllib.parse
 import html as html_module
 import requests
@@ -44,13 +45,13 @@ NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY')
 VALIDATED_MODELS_CACHE = os.path.join(os.path.dirname(__file__), 'validated_models.json')
 
 # ============================================================================
-# SYSTEM PROMPT — lean, Telegram-native, ~250 tokens
+# SYSTEM PROMPTS
 #
-# Three prompt variants, all pre-built at startup:
-#   SYSTEM_PROMPT              — used for direct AI calls (no search)
-#   SYSTEM_PROMPT_WITH_RESULTS — used when search results are provided
-#   _make_search_decision_prompt() — built per-request with today's date
-#                                    injected; used for the 'maybe' AI call
+# SYSTEM_PROMPT              — all direct AI calls (no search)
+# SYSTEM_PROMPT_WITH_RESULTS — when search results are injected into context
+# _make_search_decision_prompt() — standalone router prompt, built per-request
+#                                  with today's date; used only for the
+#                                  lightweight SEARCH/NOSEARCH decision call
 # ============================================================================
 
 _PROMPT_BASE = (
@@ -70,18 +71,19 @@ _PROMPT_BASE = (
 )
 
 _PROMPT_SEARCH_DECISION = (
-    "\n\nSEARCH DECISION:\n"
-    "You can search the web before answering. Today's date is {date}.\n\n"
-    "RULE: Your entire response must be EITHER:\n"
-    "  A) Exactly one line: SEARCH: <2-6 word query>\n"
-    "     Use this when the question needs current/real-time data: prices, news, "
-    "weather, scores, recent events, product releases, living people's status.\n"
-    "  B) A direct answer to the question.\n"
-    "     Use this for timeless facts, code, math, definitions, creative writing.\n\n"
-    "CRITICAL: If you output SEARCH:, do NOT add any other text on that line or after it. "
-    "No apologies. No explanations. No answers. Just: SEARCH: <keywords>\n\n"
-    "Query format: 2–6 words, no punctuation, no full sentences. "
-    "Example: SEARCH: bitcoin price today"
+    "You are a search router. Decide if the user's latest message needs a "
+    "live web search to answer accurately. Today's date is {date}.\n\n"
+    "Respond with EXACTLY one line:\n"
+    "  SEARCH: <2-6 word query>   — needs current/real-time info\n"
+    "  NOSEARCH                   — can answer from training knowledge\n\n"
+    "Use SEARCH for: current events, live prices, weather, sports scores, "
+    "recent news, product availability, real-time data, people's current status, "
+    "or any fact you are NOT fully confident about.\n\n"
+    "Use NOSEARCH for: coding help, math, creative writing, definitions, "
+    "explanations, greetings, opinions, general knowledge, or anything "
+    "you can confidently answer from training data.\n\n"
+    "CRITICAL: Output ONLY one line. No explanations. No apologies. "
+    "No extra text after SEARCH: query. Just the decision."
 )
 
 _PROMPT_SEARCH_RESULTS = (
@@ -98,146 +100,39 @@ SYSTEM_PROMPT_WITH_RESULTS = _PROMPT_BASE + _PROMPT_SEARCH_RESULTS
 
 
 def _make_search_decision_prompt() -> str:
-    """Build the search-decision system prompt with today's date injected.
-    Called once per 'maybe'-tier message — small cost, big accuracy gain."""
-    import datetime
+    """Build the standalone search-router prompt with today's date injected."""
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    return _PROMPT_BASE + _PROMPT_SEARCH_DECISION.format(date=today)
+    return _PROMPT_SEARCH_DECISION.format(date=today)
 
 
 # ============================================================================
-# SEARCH HEURISTIC — 3-tier classification
+# SEARCH DECISION — QUICK FILTER
 #
-# WHY THREE TIERS:
-#   Binary heuristic (v2) missed ambiguous queries that need search but have
-#   no obvious keyword signal:
-#     "is Claude better than GPT-4?" → no time/topic keyword → no search → stale
-#     "recommend a good laptop for coding" → no keyword → no search → outdated
-#     "what happened with OpenAI recently?" → vague but clearly needs current info
-#     "best practices for React in 2025?" → year hint but could be answered from knowledge
-#
-#   Three tiers balance accuracy vs API cost:
-#
-#   'no'     — coding, creative, math, greetings, definitions
-#              → skip search entirely, 1 AI call
-#
-#   'direct' — strong time + topic signal together (e.g. "bitcoin price today",
-#              "yesterday's NBA score") → high confidence, extract query
-#              directly, search now, 1 AI call with results
-#
-#   'maybe'  — ambiguous: comparisons, recommendations, vague factual questions,
-#              year-hints without clear no-search signal
-#              → ask AI with search-decision prompt (1 cheap AI call)
-#              → if AI replies SEARCH: <query> → search → 1 final AI call
-#              → if AI answers directly → use that answer, done
-#              Total: 1 extra call only when genuinely ambiguous
+# Greetings and very short messages skip the AI decision call entirely (1 call).
+# Everything else gets a lightweight AI call for SEARCH/NOSEARCH routing.
 # ============================================================================
 
-_KW_TIME = (
-    'today', 'tonight', 'now', 'latest', 'current', 'recent',
-    'yesterday', 'tomorrow', 'this week', 'this month', 'this year',
-    'last week', 'last month', 'last year', 'next week', 'next month',
+_GREETINGS = frozenset({
+    'hi', 'hello', 'hey', 'hola', 'thanks', 'thank you', 'bye', 'goodbye',
+    'ok', 'okay', 'yes', 'no', 'sure', 'lol', 'haha', 'nice', 'great', 'cool',
+    'good morning', 'good night', 'good evening', 'good afternoon',
+    'ty', 'thx', 'np', 'yw',
+})
+
+
+def _skip_search_decision(text: str) -> bool:
+    """Return True for messages that obviously don't need a web search decision call."""
+    if len(text) < 6:
+        return True
+    return text.lower().rstrip('!?.,: ') in _GREETINGS
+
+
+_APOLOGY_PATTERNS = (
+    r"I'?m sorry", r"I cannot", r"I don'?t", r"I do not",
+    r"I am unable", r"I can'?t", r"Please note", r"Note that",
+    r"However,", r"Unfortunately", r"As of my",
+    r"Here is", r"Here are", r"Let me", r"The answer", r"To answer",
 )
-_KW_TOPIC = (
-    'price', 'stock', 'crypto', 'bitcoin', 'btc', 'eth', 'market', 'trading',
-    'weather', 'forecast', 'temperature',
-    'news', 'headline', 'election', 'vote', 'poll',
-    'score', 'game', 'match', 'tournament', 'playoff', 'standings',
-    'release', 'released', 'launched', 'announced', 'update',
-    'dead', 'died', 'alive', 'arrested', 'fired', 'hired', 'resigned',
-    'war', 'earthquake', 'hurricane', 'disaster', 'outbreak',
-)
-_KW_NO_SEARCH = (
-    'write', 'code', 'create', 'generate', 'build', 'make', 'implement',
-    'explain', 'define', 'describe', 'summarize', 'rewrite', 'translate',
-    'fix', 'debug', 'refactor', 'optimize', 'calculate', 'solve', 'convert',
-    'hello', 'hi ', 'hey ', 'thanks', 'thank you', 'bye', 'good morning',
-    'tell me a joke', 'poem', 'story', 'essay', 'list',
-)
-# Comparison/recommendation patterns — almost always benefit from web search
-_KW_COMPARE = (
-    ' vs ', ' versus ', 'compare', 'better than', 'best ', 'worst ',
-    'difference between', 'recommend', 'recommendation', 'should i use',
-    'which is better', 'which one', 'alternative to', 'instead of',
-)
-
-
-def _search_tier(text: str) -> str:
-    """Classify message into 'no' / 'direct' / 'maybe' search tier.
-
-    Returns:
-        'no'     — skip search, answer directly
-        'direct' — high-confidence search needed, extract query and search now
-        'maybe'  — ambiguous, pass to AI with search-decision prompt
-    """
-    low = text.lower()
-    length = len(low)
-
-    # Very short = greeting/reaction
-    if length < 12:
-        return 'no'
-
-    has_no_search = any(kw in low for kw in _KW_NO_SEARCH)
-    has_time      = any(kw in low for kw in _KW_TIME)
-    has_topic     = any(kw in low for kw in _KW_TOPIC)
-
-    # Strong combined signal → direct search regardless of no-search keywords
-    # (e.g. "what's the latest bitcoin price?" has 'what' which isn't in no-search,
-    #  but "explain the current bitcoin price" has 'explain' which is)
-    if has_time and has_topic:
-        return 'direct'
-
-    # Definite no-search: coding, creative, math etc — but only if no overriding signal
-    if has_no_search and not has_time and not has_topic:
-        return 'no'
-
-    # Single time or topic signal without a conflicting no-search keyword → maybe
-    if has_time or has_topic:
-        return 'maybe'
-
-    # Comparison / recommendation patterns → let AI decide
-    if any(kw in low for kw in _KW_COMPARE):
-        return 'maybe'
-
-    # Year mention that might need current context
-    import datetime
-    year = datetime.datetime.now().year
-    if any(str(y) in low for y in (year - 1, year, year + 1)):
-        return 'maybe'
-
-    # Factual who/where/what/how-much questions likely need live data
-    if '?' in low and length > 20:
-        if any(kw in low for kw in ('who ', 'where ', 'when ', 'how much', 'how many', 'what is the')):
-            return 'maybe'
-
-    # No-search signals without override
-    if has_no_search:
-        return 'no'
-
-    # Default: if it's a question of reasonable length, let AI decide
-    if '?' in low and length > 30:
-        return 'maybe'
-
-    return 'no'
-
-
-def _extract_search_query(text: str) -> str:
-    """Strip question prefixes and return a clean search query (max 120 chars).
-    Used on the 'direct' tier where we don't ask the AI to reformulate."""
-    low = text.strip()
-    for prefix in (
-        'what is the', 'what are the', 'what is', 'what are',
-        'how much is', 'how much does', 'how much',
-        'who is the', 'who is', 'who won the', 'who won',
-        'where is the', 'where is',
-        'when is the', 'when is', 'when does',
-        'tell me about', 'search for', 'look up', 'find',
-    ):
-        if low.lower().startswith(prefix):
-            low = low[len(prefix):].strip()
-            break
-    low = low.rstrip('?').strip()
-    return low[:120] if low else text[:120]
 
 
 def _parse_search_query(response: str) -> Optional[str]:
@@ -280,19 +175,14 @@ def _parse_search_query(response: str) -> Optional[str]:
     # Cut at inline apology/refusal patterns — models that ignore 'ONLY this line'
     # sometimes glue the apology directly after the query without any newline.
     # e.g. "current US presidentI'm sorry, I don't have that information."
-    _APOLOGY_PATTERNS = (
-        r"I'?m sorry", r"I cannot", r"I don'?t", r"I do not",
-        r"I am unable", r"I can'?t", r"Please note", r"Note that",
-        r"However,", r"Unfortunately", r"As of my",
-    )
     for pat in _APOLOGY_PATTERNS:
         m = re.search(pat, raw, re.IGNORECASE)
         if m:
             raw = raw[:m.start()].strip()
 
-    # Cut at sentence boundary (period/!/?  followed by anything)
-    # Catches: "who is president. I cannot answer." → "who is president"
-    raw = re.sub(r'[.!?].*$', '', raw).strip()
+    # Cut at sentence boundary — space after punctuation prevents cutting decimals
+    # "3.5mm jack" stays intact; "who is president. I cannot" → "who is president"
+    raw = re.sub(r'[.!?] .*$', '', raw).strip()
 
     # Strip trailing punctuation artifacts
     raw = raw.rstrip('.,!?;:').strip()
@@ -304,12 +194,33 @@ def _parse_search_query(response: str) -> Optional[str]:
 
 def _build_search_context(query: str, snippets: list) -> str:
     """Format search results as numbered snippets with today's date for temporal grounding."""
-    import datetime
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     parts = [f"Today is {today}. Web search results for '{query}':"]
     for i, snip in enumerate(snippets, 1):
         parts.append(f"{i}. {snip}")
     return '\n'.join(parts)
+
+
+async def ai_decide_search(provider, model: Optional[str], messages: list) -> Optional[str]:
+    """Lightweight AI call to decide SEARCH vs NOSEARCH.
+
+    Uses a standalone router system prompt (not the main assistant prompt).
+    Passes full conversation history so the AI has context for multi-turn exchanges.
+    Returns a clean search query string, or None to answer directly.
+    """
+    decision_msgs = [{"role": "system", "content": _make_search_decision_prompt()}]
+    decision_msgs += [m for m in messages if m.get("role") != "system"]
+    try:
+        response = await asyncio.to_thread(
+            provider.chat,
+            messages=decision_msgs,
+            model=model,
+            enable_thinking=False,
+        ) or ""
+        return _parse_search_query(response)
+    except Exception as e:
+        logger.warning(f"[Bot] Search decision error: {e}")
+        return None
 
 
 # ============================================================================
@@ -351,7 +262,7 @@ def extract_parameter_size(model_id: str) -> int:
         return int(size) if size >= 1 else 0
     return 0
 
-def get_model_capability_score(model_id: str, model_name: str = "") -> tuple:
+def get_model_capability_score(model_id: str) -> tuple:
     model_lower = model_id.lower()
     param_size = extract_parameter_size(model_id)
 
@@ -454,7 +365,7 @@ class GroqProvider(AIProvider):
             for model in models_response.data:
                 if model.active and hasattr(model, 'id'):
                     chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
-            chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
+            chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
             self._cached_models = chat_models
             logger.info(f"✅ Groq: Detected {len(chat_models)} available models")
             return chat_models
@@ -517,7 +428,7 @@ class GeminiProvider(AIProvider):
                     continue
                 name = model.display_name if hasattr(model, 'display_name') else model_id.replace('-', ' ').title()
                 chat_models.append({"id": model_id, "name": name})
-            chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
+            chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
             self._cached_models = chat_models
             logger.info(f"✅ Gemini: Detected {len(chat_models)} available models")
             return chat_models
@@ -584,7 +495,7 @@ class OpenRouterProvider(AIProvider):
                 name = model.get('name', model_id)
                 name = name.replace(' (free)', '').replace(' (Free)', '') + " (Free)"
                 free_models.append({"id": model_id, "name": name, "context": context_length})
-            free_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
+            free_models.sort(key=lambda m: get_model_capability_score(m['id']))
             self._cached_models = free_models[:15]
             logger.info(f"✅ OpenRouter: Detected {len(self._cached_models)} free models")
             return self._cached_models
@@ -635,7 +546,7 @@ class CerebrasProvider(AIProvider):
             for model in self.client.models.list().data:
                 if hasattr(model, 'id'):
                     chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
-            chat_models.sort(key=lambda m: get_model_capability_score(m['id'], m['name']))
+            chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
             self._cached_models = chat_models
             logger.info(f"✅ Cerebras: Detected {len(chat_models)} available models")
             return chat_models
@@ -1018,7 +929,7 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🔄 Refreshing model lists...")
     try:
-        provider_manager.refresh_models()
+        await asyncio.to_thread(provider_manager.refresh_models)
         await update.message.reply_text("✅ Model lists refreshed!\n\nUse /models to see latest.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error refreshing models: {str(e)}")
@@ -1077,6 +988,7 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     session["provider"] = new_name
+    session["history"] = []  # Clear history — context from old provider is incompatible
     current_model = session["models"].get(new_name) or new_provider.get_default_model()
     await update.message.reply_text(
         f"✅ Switched to *{new_provider.get_name()}*!\nModel: `{current_model}`",
@@ -1093,7 +1005,7 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     show_all = len(context.args) > 0 and context.args[0].lower() == 'all'
     if show_all:
         await update.message.reply_text("🔄 Fetching all models from API...")
-        models = provider.get_available_models()
+        models = await asyncio.to_thread(provider.get_available_models)
         title_suffix = " (All Models)"
         footer_note = "\n\n💡 Use `/models` to see only verified models"
     else:
@@ -1106,8 +1018,15 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await update.message.reply_text("✅ Showing verified models...")
-        all_models = provider.get_available_models()
+        all_models = await asyncio.to_thread(provider.get_available_models)
         models = [m for m in all_models if m['id'] in validated_ids]
+        if not models:
+            await update.message.reply_text(
+                f"⚠️ *Validated models are no longer in {provider.get_name()}'s model list.*\n\n"
+                f"Run `/clearvalidation` then `/validate` to refresh.",
+                parse_mode='Markdown'
+            )
+            return
         title_suffix = " (Verified)"
         footer_note = f"\n\n💡 Use `/models all` to see all {len(all_models)} models"
     current_model = session["models"].get(provider_name) or provider.get_default_model()
@@ -1140,7 +1059,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     new_model = " ".join(context.args)
-    model_ids = [m['id'] for m in provider.get_available_models()]
+    model_ids = [m['id'] for m in await asyncio.to_thread(provider.get_available_models)]
     session["models"][provider_name] = new_model
     if new_model in model_ids:
         await update.message.reply_text(
@@ -1161,7 +1080,7 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     session = get_user_session(user_id)
     provider_name, provider = _resolve_provider(session)
-    models = provider.get_available_models()
+    models = await asyncio.to_thread(provider.get_available_models)
     already_validated  = get_validated_models(provider_name)
     permanently_failed = get_failed_models(provider_name)
     models_to_test = [m for m in models
@@ -1192,7 +1111,7 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"⏳ {idx}/{len(models_to_test)}: `{model_id}`...", parse_mode='Markdown'
             )
-        success, error_type = provider.test_model(model_id)
+        success, error_type = await asyncio.to_thread(provider.test_model, model_id)
         if success:
             validated.append(model_id); newly_validated.append(model_id)
             add_validated_model(provider_name, model_id)
@@ -1236,8 +1155,15 @@ async def verified_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         return
-    all_models = provider.get_available_models()
+    all_models = await asyncio.to_thread(provider.get_available_models)
     validated_models = [m for m in all_models if m['id'] in validated_ids]
+    if not validated_models:
+        await update.message.reply_text(
+            f"⚠️ *Validated models are no longer in {provider.get_name()}'s model list.*\n\n"
+            f"Run `/clearvalidation` then `/validate` to refresh.",
+            parse_mode='Markdown'
+        )
+        return
     current_model = session["models"].get(provider_name) or provider.get_default_model()
     model_list = "\n".join([
         f"• `{m['id']}`" + (" ✓" if m['id'] == current_model else "")
@@ -1343,28 +1269,25 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
-# MESSAGE HANDLER — 3-tier search loop
+# MESSAGE HANDLER — AI-routed search (v4)
 #
 # FLOW:
 #
-#   tier='no':
-#     user msg → [1 AI call] → reply
+#   Quick filter (greeting / very short):
+#     → 1 AI call, no search overhead
 #
-#   tier='direct':
-#     user msg → extract_query → web_search → [1 AI call with results] → reply
+#   Everything else:
+#     → 1 lightweight AI decision call (SEARCH/NOSEARCH)
+#       NOSEARCH → 1 AI call with full system prompt → reply
+#       SEARCH   → web_search → 1 AI call with results + full system prompt → reply
 #
-#   tier='maybe':
-#     user msg → [1 AI call with search-decision prompt]
-#       → AI replies "SEARCH: <query>" → web_search → [1 AI call with results] → reply
-#       → AI replies directly          → use that answer → reply
-#
-# UX improvements vs v2:
-#   - Typing indicator sent before EACH blocking operation (search + AI calls)
-#   - Empty/whitespace response caught with user-friendly fallback
-#   - Search tier logged for easier debugging
-#   - _parse_search_query() handles all known model quirks (quoted, repeated SEARCH:, etc.)
-#   - History rollback on any exception (was already present, kept)
-#   - Today's date injected into search-decision prompt via _make_search_decision_prompt()
+# WHY BETTER THAN 3-TIER HEURISTICS:
+#   - "playlist" no longer hits "list" keyword → no false no-search
+#   - "barcode" no longer hits "code" → no false no-search
+#   - "today's code review" no longer triggers direct search
+#   - Answers ALWAYS from full SYSTEM_PROMPT, never from decision prompt
+#   - AI crafts optimised search queries vs dumb prefix stripping
+#   - Cost: +1 small API call (max_tokens implicit, temp=0) per non-trivial message
 # ============================================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1390,97 +1313,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Append user message (popped on error below)
         session["history"].append({"role": "user", "content": user_message})
 
-        tier = _search_tier(user_message) if web_on else 'no'
-        logger.info(f"[Bot] user={user_id} tier={tier} provider={provider_name}")
+        # ── AI SEARCH DECISION ─────────────────────────────────────────────
+        skip = not web_on or _skip_search_decision(user_message)
+        search_query = None
+
+        if not skip:
+            logger.info(f"[Bot] user={user_id} provider={provider_name} → asking AI for search decision")
+            await update.message.chat.send_action(action="typing")
+            search_query = await ai_decide_search(provider, current_model, session["history"])
+            logger.info(f"[Bot] Decision: {'SEARCH: ' + search_query if search_query else 'NOSEARCH'}")
 
         bot_response = ""
 
-        # ── TIER: NO SEARCH ───────────────────────────────────────────────
-        if tier == 'no':
-            bot_response = provider.chat(
-                messages=session["history"],
-                model=current_model,
-                enable_thinking=thinking_enabled
-            ) or ""
-
-        # ── TIER: DIRECT SEARCH ───────────────────────────────────────────
-        elif tier == 'direct':
-            query  = _extract_search_query(user_message)
+        # ── SEARCH PATH ───────────────────────────────────────────────────
+        if search_query:
             engine = session.get("search_engine", "duckduckgo")
-            logger.info(f"[Bot] Direct search ({engine}): '{query}'")
+            logger.info(f"[Bot] Searching ({engine}): '{search_query}'")
 
             await update.message.chat.send_action(action="typing")
-            snippets = await web_search(query, engine)
+            snippets = await web_search(search_query, engine)
 
             if snippets:
-                ctx = _build_search_context(query, snippets)
+                ctx = _build_search_context(search_query, snippets)
                 search_msgs = session["history"][:-1].copy()
                 search_msgs.append({"role": "user", "content": user_message + "\n\n" + ctx})
-                # Use search-results system prompt
                 search_msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS})
 
                 await update.message.chat.send_action(action="typing")
-                bot_response = provider.chat(
+                bot_response = await asyncio.to_thread(
+                    provider.chat,
                     messages=search_msgs,
                     model=current_model,
-                    enable_thinking=thinking_enabled
+                    enable_thinking=thinking_enabled,
                 ) or ""
             else:
-                logger.warning("[Bot] Direct search empty, falling back to direct AI call")
-                bot_response = provider.chat(
+                logger.warning("[Bot] Search returned no results — falling back to direct AI")
+                bot_response = await asyncio.to_thread(
+                    provider.chat,
                     messages=session["history"],
                     model=current_model,
-                    enable_thinking=thinking_enabled
+                    enable_thinking=thinking_enabled,
                 ) or ""
 
-        # ── TIER: MAYBE — let AI decide ───────────────────────────────────
-        else:  # 'maybe'
-            decision_prompt = _make_search_decision_prompt()
-
-            # Build decision messages: search-decision system prompt + history
-            # (no system message already in history — _trim_history never adds one)
-            decision_msgs = [{"role": "system", "content": decision_prompt}]
-            decision_msgs += [m for m in session["history"] if m.get("role") != "system"]
-
-            await update.message.chat.send_action(action="typing")
-            ai_decision = provider.chat(
-                messages=decision_msgs,
-                model=current_model
+        # ── NO-SEARCH PATH ────────────────────────────────────────────────
+        else:
+            if skip:
+                logger.info(f"[Bot] user={user_id} provider={provider_name} → quick-filter skip, direct AI call")
+            bot_response = await asyncio.to_thread(
+                provider.chat,
+                messages=session["history"],
+                model=current_model,
+                enable_thinking=thinking_enabled,
             ) or ""
-
-            search_query = _parse_search_query(ai_decision)
-
-            if search_query:
-                # AI wants to search
-                engine = session.get("search_engine", "duckduckgo")
-                logger.info(f"[Bot] AI-requested search ({engine}): '{search_query}'")
-
-                await update.message.chat.send_action(action="typing")
-                snippets = await web_search(search_query, engine)
-
-                if snippets:
-                    ctx = _build_search_context(search_query, snippets)
-                    search_msgs = session["history"][:-1].copy()
-                    search_msgs.append({"role": "user", "content": user_message + "\n\n" + ctx})
-                    search_msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS})
-
-                    await update.message.chat.send_action(action="typing")
-                    bot_response = provider.chat(
-                        messages=search_msgs,
-                        model=current_model,
-                        enable_thinking=thinking_enabled
-                    ) or ""
-                else:
-                    # Search found nothing — re-ask AI without search context
-                    logger.warning("[Bot] Maybe-search empty, re-querying AI directly")
-                    bot_response = provider.chat(
-                        messages=session["history"],
-                        model=current_model,
-                        enable_thinking=thinking_enabled
-                    ) or ""
-            else:
-                # AI answered directly on the decision call — use that answer
-                bot_response = ai_decision
 
         # ── Fallback for empty response ────────────────────────────────────
         if not bot_response.strip():
