@@ -129,8 +129,8 @@ def _skip_search_decision(text: str) -> bool:
 
 _APOLOGY_PATTERNS = (
     r"SEARCH:",                                           # doubled output (Cerebras quirk)
-    r"I'?m sorry", r"I cannot", r"I don'?t", r"I do not",
-    r"I am unable", r"I can'?t", r"Please note", r"Note that",
+    r"I['\u2019]?m sorry", r"I cannot", r"I don['\u2019]?t", r"I do not",
+    r"I am unable", r"I can['\u2019]?t", r"Please note", r"Note that",
     r"However,", r"Unfortunately", r"As of my",
     r"Here is", r"Here are", r"Let me", r"The answer", r"To answer",
 )
@@ -163,8 +163,8 @@ def _parse_search_query(response: str) -> Optional[str]:
     # Take only the first line — some models append full answer after newline
     raw = raw.split('\n')[0].strip()
 
-    # Strip surrounding quotes some models add
-    for q in ('"', "'"):
+    # Strip surrounding quotes/backticks some models add
+    for q in ('"', "'", '`'):
         if len(raw) > 2 and raw[0] == q and raw[-1] == q:
             raw = raw[1:-1].strip()
 
@@ -175,20 +175,23 @@ def _parse_search_query(response: str) -> Optional[str]:
         else:
             break
 
-    # Cut at inline apology/refusal patterns — models that ignore 'ONLY this line'
-    # sometimes glue the apology directly after the query without any newline.
+    # Cut at the EARLIEST inline apology/refusal match — models that ignore 'ONLY this line'
+    # sometimes glue apology text directly after the query without any newline.
     # e.g. "current US presidentI'm sorry, I don't have that information."
+    # Uses minimum-position approach: find earliest match across all patterns, cut once.
+    cut_at = len(raw)
     for pat in _APOLOGY_PATTERNS:
         m = re.search(pat, raw, re.IGNORECASE)
-        if m:
-            raw = raw[:m.start()].strip()
+        if m and m.start() < cut_at:
+            cut_at = m.start()
+    raw = raw[:cut_at].strip()
 
     # Cut at sentence boundary — space after punctuation prevents cutting decimals
     # "3.5mm jack" stays intact; "who is president. I cannot" → "who is president"
     raw = re.sub(r'[.!?] .*$', '', raw).strip()
 
-    # Strip trailing punctuation artifacts
-    raw = raw.rstrip('.,!?;:').strip()
+    # Strip trailing punctuation and Markdown artifacts (* from bold markers)
+    raw = raw.rstrip('.,!?;:*`').strip()
 
     raw = raw[:120]
     # Require at least 2 chars — a 1-char query is a parsing failure, fall back

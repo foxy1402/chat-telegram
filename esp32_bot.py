@@ -179,8 +179,8 @@ def _parse_search_query(response):
     if nl != -1:
         raw = raw[:nl].strip()
 
-    # Strip surrounding quotes
-    if len(raw) > 2 and raw[0] in ('"', "'") and raw[-1] == raw[0]:
+    # Strip surrounding quotes/backticks
+    if len(raw) > 2 and raw[0] in ('"', "'", '`') and raw[-1] == raw[0]:
         raw = raw[1:-1].strip()
 
     # Strip repeated SEARCH: prefix (rare but happens)
@@ -195,8 +195,10 @@ def _parse_search_query(response):
     # Using pure str.find() — no ure import needed, saves ~2KB RAM on ESP32.
     _CUTS = (
         "search:",                                            # doubled output quirk
-        "i'm sorry", "i am sorry", "i cannot", "i don't", "i do not",
-        "i am unable", "i can't", "please note", "note that",
+        "i\u2019m sorry", "i'm sorry", "i am sorry",         # Unicode + ASCII apostrophe variants
+        "i cannot", "i don\u2019t", "i don't", "i do not",
+        "i am unable", "i can\u2019t", "i can't",
+        "please note", "note that",
         "however,", "unfortunately", "as of my",
         "here is", "here are", "let me", "the answer", "to answer",
     )
@@ -216,8 +218,8 @@ def _parse_search_query(response):
             raw = raw[:idx].strip()
             break
 
-    # Strip trailing punctuation artifacts
-    raw = raw.rstrip('.,!?;:').strip()
+    # Strip trailing punctuation and Markdown artifacts (* from bold markers)
+    raw = raw.rstrip('.,!?;:*`').strip()
 
     raw = raw[:120]
     # Require at least 2 chars — 1-char result means parsing failed, fall back
