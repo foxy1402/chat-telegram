@@ -128,6 +128,7 @@ def _skip_search_decision(text: str) -> bool:
 
 
 _APOLOGY_PATTERNS = (
+    r"SEARCH:",                                           # doubled output (Cerebras quirk)
     r"I'?m sorry", r"I cannot", r"I don'?t", r"I do not",
     r"I am unable", r"I can'?t", r"Please note", r"Note that",
     r"However,", r"Unfortunately", r"As of my",
@@ -141,6 +142,8 @@ def _parse_search_query(response: str) -> Optional[str]:
     Returns clean query string if AI wants to search, or None if it answered directly.
 
     Handles all known model quirks:
+    - Doubled output (no newline): 'SEARCH: bitcoin priceSEARCH: bitcoin price'
+      Root cause: Cerebras doubles the entire line without a newline break.
     - Apology glued inline (no newline): 'SEARCH: current US presidentI'm sorry...'
       Root cause: small models (Cerebras, some Groq) ignore 'ONLY this line' instruction
       and append a refusal/apology directly after the query without a newline break.

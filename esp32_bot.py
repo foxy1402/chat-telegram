@@ -151,6 +151,9 @@ def _parse_search_query(response):
     Returns clean query string or None if AI answered directly.
 
     Handles all known model quirks — pure string ops, no ure/re import:
+    - Doubled output (no newline):
+        'SEARCH: bitcoin priceSEARCH: bitcoin price'
+        Root cause: Cerebras doubles the entire line. Fix: cut at embedded 'search:'.
     - Apology glued inline (no newline):
         'SEARCH: current US presidentI am sorry, I cannot...'
         Root cause: small models ignore 'ONLY this line' instruction.
@@ -191,6 +194,7 @@ def _parse_search_query(response):
     # still sometimes glue apology text directly after the query without a newline.
     # Using pure str.find() — no ure import needed, saves ~2KB RAM on ESP32.
     _CUTS = (
+        "search:",                                            # doubled output quirk
         "i'm sorry", "i am sorry", "i cannot", "i don't", "i do not",
         "i am unable", "i can't", "please note", "note that",
         "however,", "unfortunately", "as of my",
