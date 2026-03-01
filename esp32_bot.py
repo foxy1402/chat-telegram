@@ -9,23 +9,23 @@ Runtime:  MicroPython 1.20+
 
 ZERO DISK WRITES — all state is in-memory, reboot resets everything.
 
-CHANGES v2 → v3 (3-tier search restored + parser hardened):
-  - 'maybe' tier RESTORED: ambiguous queries ask AI with search-decision prompt.
-    Binary heuristic missed: "is X better than Y?", "recommend a laptop",
-    "what happened with OpenAI?" — no keyword signal but clearly need search.
-    Cost: 1 extra API call only on genuinely ambiguous queries.
-  - _parse_search_query() hardened against inline apologies (same root-cause
-    bug that hit bot.py — model returns 'SEARCH: queryI'm sorry...' on one line):
-      - Scans for 12 apology/refusal keywords, truncates at first match
-      - Truncates at first sentence-ending punctuation . ! ?
-      - Requires min 2 chars — short result means parsing failed, falls back
-      - Pure string ops only, no ure/re import needed (saves ~2KB RAM)
-  - _PROMPT_SEARCH_DECISION_TEMPLATE tightened with explicit CRITICAL: rule
-    to prevent models from appending text after SEARCH: in the first place
-  - WDT fed before every blocking call in all three tiers
-  - Typing indicator sent before every blocking operation
-  - Empty AI response caught with friendly fallback message
-  - History rollback on any error
+CHANGES v3 → v4 (AI-routed search — keyword heuristics removed):
+  - REMOVED all keyword heuristics (_KW_TIME, _KW_TOPIC, _KW_NO_SEARCH,
+    _KW_COMPARE) and _search_tier() / _extract_search_query() functions.
+    Root cause: substring matching was brittle — "playlist" hit "list",
+    "barcode" hit "code", "today's code review" falsely triggered search.
+  - NEW: AI-routed 2-step flow. Every non-trivial message gets a lightweight
+    AI decision call (max_tokens=60, temperature=0) that returns either
+    SEARCH: <optimized query> or NOSEARCH. The AI crafts better search
+    queries than client-side prefix stripping ever could.
+  - Quick filter: greetings and very short messages (<6 chars) skip the
+    decision call entirely — 1 AI call, no overhead.
+  - Answers ALWAYS come from the full system prompt, never from the
+    decision prompt. Consistent quality whether or not search triggers.
+  - _parse_search_query() retained for robust parsing of AI decision output.
+  - Cost: +1 lightweight API call per non-trivial message.
+  - Prior v3 fixes retained: WDT feeding, typing indicators, empty response
+    fallback, history rollback on error.
 """
 
 import network
@@ -72,7 +72,7 @@ RATE_LIMIT_SECS  = 2
 #
 # SYSTEM_PROMPT              — normal AI calls
 # SYSTEM_PROMPT_WITH_RESULTS — when search results are passed in
-# _make_search_decision_prompt() — builds the 'maybe' decision prompt with
+# _make_search_decision_prompt() — builds AI search-routing prompt with
 #                                  today's date injected at call time
 # ============================================================================
 
@@ -92,18 +92,20 @@ _PROMPT_BASE = (
     "- Use fenced code blocks with language name for all code"
 )
 
-_PROMPT_SEARCH_DECISION_TEMPLATE = (
-    "\n\nSEARCH DECISION:\n"
-    "You can search the web before answering. Today's date is {date}.\n\n"
-    "RULE: Your entire response must be EITHER:\n"
-    "  A) Exactly one line: SEARCH: <2-6 word query>\n"
-    "     Use when the question needs current/real-time data: prices, news, "
-    "weather, scores, recent events, product releases, living people's status.\n"
-    "  B) A direct answer to the question.\n"
-    "     Use for timeless facts, code, math, definitions, creative writing.\n\n"
-    "CRITICAL: If you output SEARCH:, do NOT add any other text on that line "
-    "or after it. No apologies. No explanations. Just: SEARCH: <keywords>\n\n"
-    "Query: 2-6 words, no punctuation. Example: SEARCH: bitcoin price today"
+_PROMPT_SEARCH_DECISION = (
+    "You are a search router. Decide if the user's latest message needs a "
+    "live web search to answer accurately. Today's date is {date}.\n\n"
+    "Respond with EXACTLY one line:\n"
+    "  SEARCH: <2-6 word query>   — needs current/real-time info\n"
+    "  NOSEARCH                   — can answer from training knowledge\n\n"
+    "Use SEARCH for: current events, live prices, weather, sports scores, "
+    "recent news, product info, real-time data, people's current status, "
+    "or any fact you are NOT confident about.\n\n"
+    "Use NOSEARCH for: coding help, math, creative writing, definitions, "
+    "explanations, greetings, opinions, general knowledge, or anything "
+    "you can confidently answer from training data.\n\n"
+    "CRITICAL: Output ONLY one line. No explanations. No apologies. "
+    "No extra text after SEARCH: query. Just the decision."
 )
 
 _PROMPT_SEARCH_RESULTS = (
@@ -120,120 +122,28 @@ SYSTEM_PROMPT_WITH_RESULTS = _PROMPT_BASE + _PROMPT_SEARCH_RESULTS
 def _make_search_decision_prompt():
     t = time.localtime()
     today = "%04d-%02d-%02d" % (t[0], t[1], t[2])
-    return _PROMPT_BASE + _PROMPT_SEARCH_DECISION_TEMPLATE.replace("{date}", today)
+    return _PROMPT_SEARCH_DECISION.replace("{date}", today)
 
 
 # ============================================================================
-# SEARCH TIER CLASSIFICATION
+# SEARCH DECISION — QUICK FILTER
 #
-# 'no'     — coding, creative, math, greetings → 1 AI call
-# 'direct' — strong time + topic signal → extract query, search, 1 AI call
-# 'maybe'  — ambiguous → ask AI with search-decision prompt
-#             AI replies SEARCH: <query> → search → 1 final AI call
-#             AI answers directly        → use that answer, done
+# Greetings and very short messages skip the AI decision call entirely.
+# Everything else gets a lightweight AI call for SEARCH/NOSEARCH routing.
 # ============================================================================
 
-_KW_TIME = (
-    'today','tonight','now','latest','current','recent',
-    'yesterday','tomorrow','this week','this month','this year',
-    'last week','last month','last year','next week','next month',
-)
-_KW_TOPIC = (
-    'price','stock','crypto','bitcoin','btc','eth','market','trading',
-    'weather','forecast','temperature',
-    'news','headline','election','vote','poll',
-    'score','game','match','tournament','playoff','standings',
-    'release','released','launched','announced','update',
-    'dead','died','alive','arrested','fired','hired','resigned',
-    'war','earthquake','hurricane','disaster','outbreak',
-)
-_KW_NO_SEARCH = (
-    'write','code','create','generate','build','make','implement',
-    'explain','define','describe','summarize','rewrite','translate',
-    'fix','debug','refactor','optimize','calculate','solve','convert',
-    'hello','hi ','hey ','thanks','thank you','bye','good morning',
-    'tell me a joke','poem','story','essay','list',
-)
-_KW_COMPARE = (
-    ' vs ',' versus ','compare','better than','best ',
-    'difference between','recommend','should i use',
-    'which is better','which one','alternative to',
+_GREETINGS = (
+    'hi', 'hello', 'hey', 'hola', 'thanks', 'thank you', 'bye',
+    'ok', 'okay', 'yes', 'no', 'sure', 'lol', 'haha', 'nice',
+    'good morning', 'good night', 'good evening', 'good afternoon',
 )
 
 
-def _search_tier(text):
-    low    = text.lower()
-    length = len(low)
-
-    if length < 12:
-        return 'no'
-
-    has_no = False
-    for kw in _KW_NO_SEARCH:
-        if kw in low:
-            has_no = True
-            break
-
-    has_time = False
-    for kw in _KW_TIME:
-        if kw in low:
-            has_time = True
-            break
-
-    has_topic = False
-    for kw in _KW_TOPIC:
-        if kw in low:
-            has_topic = True
-            break
-
-    if has_time and has_topic:
-        return 'direct'
-
-    if has_no and not has_time and not has_topic:
-        return 'no'
-
-    if has_time or has_topic:
-        return 'maybe'
-
-    for kw in _KW_COMPARE:
-        if kw in low:
-            return 'maybe'
-
-    t    = time.localtime()
-    year = t[0]
-    for y in (str(year - 1), str(year), str(year + 1)):
-        if y in low:
-            return 'maybe'
-
-    if '?' in low and length > 20:
-        for kw in ('who ', 'where ', 'when ', 'how much', 'how many', 'what is the'):
-            if kw in low:
-                return 'maybe'
-
-    if has_no:
-        return 'no'
-
-    if '?' in low and length > 30:
-        return 'maybe'
-
-    return 'no'
-
-
-def _extract_search_query(text):
-    low = text.strip()
-    for prefix in (
-        'what is the','what are the','what is','what are',
-        'how much is','how much does','how much',
-        'who is the','who is','who won the','who won',
-        'where is the','where is',
-        'when is the','when is','when does',
-        'tell me about','search for','look up','find',
-    ):
-        if low.lower().startswith(prefix):
-            low = low[len(prefix):].strip()
-            break
-    low = low.rstrip('?').strip()
-    return low[:120] if low else text[:120]
+def _skip_search_decision(text):
+    """True for messages that obviously don't need web search."""
+    if len(text) < 6:
+        return True
+    return text.lower().rstrip('!?.,: ') in _GREETINGS
 
 
 def _parse_search_query(response):
@@ -247,7 +157,7 @@ def _parse_search_query(response):
         Fix: scan for apology keywords, truncate at first match.
     - Period-terminated with explanation:
         'SEARCH: who is president. I cannot answer that.'
-        Fix: truncate at first . ! ?
+        Fix: truncate at first '. ' / '! ' / '? ' (space-delimited to preserve decimals)
     - Answer appended after newline:
         'SEARCH: bitcoin price\n\nBitcoin is currently...'
         Fix: split('\n')[0]
@@ -284,6 +194,7 @@ def _parse_search_query(response):
         "i'm sorry", "i am sorry", "i cannot", "i don't", "i do not",
         "i am unable", "i can't", "please note", "note that",
         "however,", "unfortunately", "as of my",
+        "here is", "here are", "let me", "the answer", "to answer",
     )
     raw_lower = raw.lower()
     cut_at = len(raw)
@@ -295,7 +206,7 @@ def _parse_search_query(response):
 
     # Cut at sentence boundary — catches 'who is president. I cannot answer.'
     # Find the earliest . ! ? and truncate there
-    for punct in ('.', '!', '?'):
+    for punct in ('. ', '! ', '? '):
         idx = raw.find(punct)
         if idx != -1:
             raw = raw[:idx].strip()
@@ -573,17 +484,18 @@ def tg_send(chat_id, text):
             if try_md: obj["parse_mode"] = "Markdown"
             payload = ujson.dumps(obj); del obj
             r = None
+            ok = False
             try:
                 r = urequests.post(url, data=payload, headers={"Content-Type":"application/json"})
                 body = r.json(); r.close(); r = None
-                ok = bool(body.get("ok")); del body, payload; gc.collect()
-                if ok: break
+                ok = bool(body.get("ok")); del body; gc.collect()
             except Exception as e:
                 print("[TG] send error:", e)
                 if r:
                     try: r.close()
                     except Exception: pass
             del payload; gc.collect()
+            if ok: break
 
 
 def tg_send_action(chat_id):
@@ -620,7 +532,7 @@ def ai_chat(provider_key, model, messages, sys_prompt=None):
         data = r.json(); r.close(); r = None; gc.collect()
         choices = data.get("choices")
         if choices and len(choices) > 0:
-            content = choices[0].get("message",{}).get("content","(empty)")
+            content = choices[0].get("message",{}).get("content") or "(empty)"
             del data
             if len(content) > MAX_RESPONSE_LEN:
                 content = content[:MAX_RESPONSE_LEN] + "\n[truncated]"
@@ -636,6 +548,38 @@ def ai_chat(provider_key, model, messages, sys_prompt=None):
             except Exception: pass
         gc.collect()
         return AI_ERROR, "Error calling %s: %s" % (prov["name"], str(e))
+
+
+def ai_decide_search(provider_key, model, messages):
+    """Lightweight AI call: returns search query string or None (no search)."""
+    prov = PROVIDERS.get(provider_key)
+    if not prov:
+        return None
+    prompt = _make_search_decision_prompt()
+    chat_msgs = [{"role": "system", "content": prompt}]
+    chat_msgs.extend(messages)
+    body = {"model": model, "messages": chat_msgs, "temperature": 0.0, "max_tokens": 60}
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + prov["key"]}
+    payload = ujson.dumps(body); del body, chat_msgs; gc.collect()
+    r = None
+    try:
+        r = urequests.post(prov["url"], data=payload, headers=headers)
+        del payload
+        data = r.json(); r.close(); r = None; gc.collect()
+        choices = data.get("choices")
+        if choices and len(choices) > 0:
+            content = choices[0].get("message", {}).get("content") or ""
+            del data
+            return _parse_search_query(content)
+        del data
+        return None
+    except Exception as e:
+        if r:
+            try: r.close()
+            except Exception: pass
+        gc.collect()
+        print("[Bot] Search decision error: %s" % e)
+        return None
 
 # ============================================================================
 # WEB SEARCH
@@ -736,7 +680,7 @@ def web_search(query, engine):
 def get_session(user_id):
     if user_id not in sessions:
         if len(sessions) >= MAX_SESSIONS:
-            oldest = next(iter(sessions))
+            oldest = min(sessions, key=lambda uid: sessions[uid]["last_msg_time"])
             del sessions[oldest]; gc.collect()
         prov = DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else next(iter(PROVIDERS), "")
         eng  = "brave" if BRAVE_API_KEY else "duckduckgo"
@@ -763,7 +707,7 @@ def handle_command(chat_id, text, user_id):
 
     if cmd == "/start":
         tg_send(chat_id,
-            "ESP32-C3 AI Bot v3\n\nProvider: %s\nModel: %s\nAvailable: %s\n\nType /help." %
+            "ESP32-C3 AI Bot v4\n\nProvider: %s\nModel: %s\nAvailable: %s\n\nType /help." %
             (s["provider"], s["model"], ", ".join(PROVIDERS.keys())))
         return True
 
@@ -892,18 +836,12 @@ def handle_command(chat_id, text, user_id):
     return True
 
 # ============================================================================
-# MESSAGE HANDLER — 3-tier search loop
+# MESSAGE HANDLER — AI-routed search
 #
-# tier='no':
-#   user msg → [1 AI call] → reply
-#
-# tier='direct':
-#   user msg → _extract_search_query → web_search → [1 AI call with results] → reply
-#
-# tier='maybe':
-#   user msg → [1 AI call with search-decision prompt]
-#     → AI replies "SEARCH: <query>" → web_search → [1 AI call with results] → reply
-#     → AI answers directly          → use that answer → reply
+# 1. Quick filter: greetings / very short → 1 AI call (no search overhead)
+# 2. Everything else → 1 lightweight decision call (SEARCH/NOSEARCH)
+#    → NOSEARCH: 1 AI call with full system prompt
+#    → SEARCH:   web search → 1 AI call with results + full system prompt
 # ============================================================================
 
 def _build_search_context(query, results):
@@ -935,6 +873,17 @@ def handle_message(chat_id, text, user_id):
         return
     s["last_msg_time"] = now
 
+    # Emergency memory cleanup — evict another user's session if critically low
+    if gc.mem_free() < 20000:
+        gc.collect()
+        if gc.mem_free() < 20000:
+            for uid in list(sessions):
+                if uid != user_id:
+                    del sessions[uid]
+                    gc.collect()
+                    print("[MEM] Freed session for %d, %d bytes free" % (uid, gc.mem_free()))
+                    break
+
     if len(text) > MAX_RESPONSE_LEN:
         text = text[:MAX_RESPONSE_LEN]
 
@@ -944,26 +893,29 @@ def handle_message(chat_id, text, user_id):
     if wdt: wdt.feed()
 
     web_on = s.get("web_search", True)
-    tier   = _search_tier(text) if web_on else 'no'
-    print("[Bot] tier=%s len=%d provider=%s" % (tier, len(text), s["provider"]))
+    skip   = not web_on or _skip_search_decision(text)
+    search_query = None
+
+    # ── AI SEARCH DECISION ───────────────────────────────────────────────
+    if not skip:
+        print("[Bot] Asking AI for search decision...")
+        tg_send_action(chat_id)
+        if wdt: wdt.feed()
+        search_query = ai_decide_search(s["provider"], s["model"], s["history"])
+        print("[Bot] Decision: %s" % ("SEARCH '%s'" % search_query if search_query else "NOSEARCH"))
 
     result_type = AI_OK
     response    = ""
 
-    # ── TIER: NO SEARCH ──────────────────────────────────────────────────
-    if tier == 'no':
-        result_type, response = ai_chat(s["provider"], s["model"], s["history"])
-
-    # ── TIER: DIRECT SEARCH ──────────────────────────────────────────────
-    elif tier == 'direct':
-        query  = _extract_search_query(text)
-        engine = s.get("search_engine","duckduckgo")
-        print("[Bot] Direct search (%s): '%s'" % (engine, query))
+    # ── SEARCH PATH ──────────────────────────────────────────────────────
+    if search_query:
+        engine = s.get("search_engine", "duckduckgo")
+        print("[Bot] Searching (%s): '%s'" % (engine, search_query))
         tg_send_action(chat_id)
         if wdt: wdt.feed()
-        results = web_search(query, engine)
+        results = web_search(search_query, engine)
         if results:
-            ctx = _build_search_context(query, results); del results; gc.collect()
+            ctx = _build_search_context(search_query, results); del results; gc.collect()
             search_msgs = list(s["history"][:-1])
             search_msgs.append({"role":"user","content":text+"\n\n"+ctx})
             tg_send_action(chat_id)
@@ -973,45 +925,13 @@ def handle_message(chat_id, text, user_id):
             del search_msgs, ctx; gc.collect()
         else:
             del results; gc.collect()
+            if wdt: wdt.feed()
             result_type, response = ai_chat(s["provider"], s["model"], s["history"])
 
-    # ── TIER: MAYBE — ask AI to decide ───────────────────────────────────
-    else:  # 'maybe'
-        decision_prompt = _make_search_decision_prompt()
-        decision_msgs   = list(s["history"])
-        tg_send_action(chat_id)
+    # ── NO-SEARCH PATH ───────────────────────────────────────────────────
+    else:
         if wdt: wdt.feed()
-        d_type, ai_decision = ai_chat(s["provider"], s["model"], decision_msgs, decision_prompt)
-        del decision_msgs; gc.collect()
-
-        if d_type == AI_ERROR:
-            # Decision call failed — fall back to plain AI
-            result_type, response = ai_chat(s["provider"], s["model"], s["history"])
-        else:
-            search_query = _parse_search_query(ai_decision)
-            if search_query:
-                engine = s.get("search_engine","duckduckgo")
-                print("[Bot] AI search (%s): '%s'" % (engine, search_query))
-                tg_send_action(chat_id)
-                if wdt: wdt.feed()
-                results = web_search(search_query, engine)
-                if results:
-                    ctx = _build_search_context(search_query, results); del results; gc.collect()
-                    search_msgs = list(s["history"][:-1])
-                    search_msgs.append({"role":"user","content":text+"\n\n"+ctx})
-                    tg_send_action(chat_id)
-                    if wdt: wdt.feed()
-                    result_type, response = ai_chat(
-                        s["provider"], s["model"], search_msgs, SYSTEM_PROMPT_WITH_RESULTS)
-                    del search_msgs, ctx; gc.collect()
-                else:
-                    del results; gc.collect()
-                    result_type, response = ai_chat(s["provider"], s["model"], s["history"])
-            else:
-                # AI answered directly — use it
-                result_type, response = AI_OK, ai_decision
-
-        del decision_prompt; gc.collect()
+        result_type, response = ai_chat(s["provider"], s["model"], s["history"])
 
     # ── Empty response fallback ──────────────────────────────────────────
     if result_type == AI_OK and not response.strip():
@@ -1038,7 +958,7 @@ def main():
 
     boot_time = time.time()
     print("=" * 40)
-    print("ESP32-C3 Telegram Bot v3 starting...")
+    print("ESP32-C3 Telegram Bot v4 starting...")
     print("Providers:", ", ".join(PROVIDERS.keys()) if PROVIDERS else "NONE!")
     print("=" * 40)
 
@@ -1072,7 +992,7 @@ def main():
         for upd in updates:
             if wdt: wdt.feed()
             tg_offset = upd.get("update_id", 0) + 1
-            msg = upd.get("message")
+            msg = upd.get("message") or upd.get("edited_message")
             if not msg: continue
             chat_id = msg.get("chat",{}).get("id")
             text    = msg.get("text","")
