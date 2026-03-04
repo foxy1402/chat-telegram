@@ -224,33 +224,42 @@ def _build_search_context(query: str, snippets: list) -> str:
     return '\n'.join(parts)
 
 
+_SEARCH_DECISION_RETRIES = 2
+_SEARCH_DECISION_RETRY_DELAY = 1.0  # seconds between retries
+
 async def ai_decide_search(provider, model: Optional[str], messages: list) -> Optional[str]:
     """Lightweight AI call to decide SEARCH vs NOSEARCH.
 
     Uses a standalone router system prompt (not the main assistant prompt).
     Passes full conversation history so the AI has context for multi-turn exchanges.
+    Retries up to _SEARCH_DECISION_RETRIES times on empty/failed responses.
     Returns a clean search query string, or None to answer directly.
     """
     decision_msgs = [{"role": "system", "content": _make_search_decision_prompt()}]
     decision_msgs += [m for m in messages if m.get("role") != "system"]
-    try:
-        response = await asyncio.to_thread(
-            provider.chat,
-            messages=decision_msgs,
-            model=model,
-            enable_thinking=False,
-        ) or ""
-        return _parse_search_query(response)
-    except Exception as e:
-        logger.warning(f"[Bot] Search decision error: {e}")
-        # Fall back to searching with the last user message so we don't silently skip search
-        last_user = next(
-            (m["content"] for m in reversed(messages) if m.get("role") == "user"), None
-        )
-        if last_user:
-            logger.warning("[Bot] Search decision failed — falling back to search with user message")
-            return last_user[:200]
-        return None
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, _SEARCH_DECISION_RETRIES + 1):
+        try:
+            response = await asyncio.to_thread(
+                provider.chat,
+                messages=decision_msgs,
+                model=model,
+                enable_thinking=False,
+            ) or ""
+            if response.strip():
+                return _parse_search_query(response)
+            # Empty response — treat as a transient failure and retry
+            logger.warning(f"[Bot] Search decision attempt {attempt}: empty response, retrying...")
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[Bot] Search decision attempt {attempt} error: {e}, retrying...")
+        if attempt < _SEARCH_DECISION_RETRIES:
+            await asyncio.sleep(_SEARCH_DECISION_RETRY_DELAY)
+
+    logger.warning(f"[Bot] Search decision failed after {_SEARCH_DECISION_RETRIES} attempts "
+                   f"({last_error or 'empty response'}) — falling back to NOSEARCH")
+    return None
 
 
 # ============================================================================
