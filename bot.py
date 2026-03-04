@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 import json
 import asyncio
@@ -23,16 +24,31 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ALLOWED_USER_IDS = [uid.strip() for uid in os.getenv('ALLOWED_USER_IDS', '').split(',') if uid.strip()]
 DEFAULT_PROVIDER = os.getenv('DEFAULT_PROVIDER', 'groq')
-MAX_TOKENS = int(os.getenv('MAX_TOKENS', '512'))
-TEMPERATURE = float(os.getenv('TEMPERATURE', '0.7'))
-MAX_HISTORY_MESSAGES = int(os.getenv('MAX_HISTORY_MESSAGES', '20'))  # must be even
+try:
+    MAX_TOKENS = int(os.getenv('MAX_TOKENS', '512'))
+except ValueError:
+    MAX_TOKENS = 512
+try:
+    TEMPERATURE = float(os.getenv('TEMPERATURE', '0.7'))
+except ValueError:
+    TEMPERATURE = 0.7
+try:
+    MAX_HISTORY_MESSAGES = int(os.getenv('MAX_HISTORY_MESSAGES', '20'))  # must be even
+except ValueError:
+    MAX_HISTORY_MESSAGES = 20
 MAX_MESSAGE_LENGTH = 4096
 
 # Web Search Configuration
 BRAVE_API_KEY = os.getenv('BRAVE_API_KEY', '')
 SEARCH_ENGINE = os.getenv('SEARCH_ENGINE', 'brave').lower()
-MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '3'))
-MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '300'))
+try:
+    MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '3'))
+except ValueError:
+    MAX_SEARCH_RESULTS = 3
+try:
+    MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '300'))
+except ValueError:
+    MAX_SNIPPET_LEN = 300
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
@@ -364,7 +380,7 @@ class GroqProvider(AIProvider):
         return response.choices[0].message.content
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models:
+        if self._cached_models is not None:
             return self._cached_models
         try:
             models_response = self.client.models.list()
@@ -423,7 +439,7 @@ class GeminiProvider(AIProvider):
         return chat.send_message(messages[-1]["content"]).text
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models:
+        if self._cached_models is not None:
             return self._cached_models
         try:
             chat_models = []
@@ -479,7 +495,7 @@ class OpenRouterProvider(AIProvider):
         return response.choices[0].message.content
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models:
+        if self._cached_models is not None:
             return self._cached_models
         try:
             response = requests.get(
@@ -495,9 +511,12 @@ class OpenRouterProvider(AIProvider):
                 context_length = model.get('context_length', 0)
                 if ':free' not in model_id.lower() or context_length <= 0:
                     continue
-                ps = str(pricing.get('prompt', ''))
-                cs = str(pricing.get('completion', ''))
-                if ps not in ["0", "0.0", "0.00"] or cs not in ["0", "0.0", "0.00"]:
+                try:
+                    prompt_price = float(pricing.get('prompt') or 0)
+                    compl_price  = float(pricing.get('completion') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if prompt_price != 0.0 or compl_price != 0.0:
                     continue
                 name = model.get('name', model_id)
                 name = name.replace(' (free)', '').replace(' (Free)', '') + " (Free)"
@@ -546,7 +565,7 @@ class CerebrasProvider(AIProvider):
         return response.choices[0].message.content
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models:
+        if self._cached_models is not None:
             return self._cached_models
         try:
             chat_models = []
@@ -723,12 +742,29 @@ class ProviderManager:
 provider_manager = ProviderManager()
 user_sessions: Dict[str, Dict] = {}
 
+_SESSION_TTL     = 86400   # evict sessions inactive for >24 h
+_CLEANUP_INTERVAL = 3600   # run cleanup at most once per hour
+_last_session_cleanup: float = 0.0
+
 
 # ============================================================================
 # SESSION HELPERS
 # ============================================================================
 
 def get_user_session(user_id: str) -> Dict:
+    global _last_session_cleanup
+    now = time.time()
+
+    # Lazy hourly eviction of inactive sessions
+    if now - _last_session_cleanup > _CLEANUP_INTERVAL:
+        stale = [uid for uid, s in user_sessions.items()
+                 if now - s.get("last_seen", 0) > _SESSION_TTL]
+        for uid in stale:
+            del user_sessions[uid]
+        if stale:
+            logger.info(f"[Session] Evicted {len(stale)} stale session(s)")
+        _last_session_cleanup = now
+
     if user_id not in user_sessions:
         default_engine = "brave" if (SEARCH_ENGINE == "brave" and BRAVE_API_KEY) else "duckduckgo"
         user_sessions[user_id] = {
@@ -738,7 +774,10 @@ def get_user_session(user_id: str) -> Dict:
             "thinking_enabled": False,
             "web_search":       True,
             "search_engine":    default_engine,
+            "last_seen":        now,
         }
+    else:
+        user_sessions[user_id]["last_seen"] = now
     return user_sessions[user_id]
 
 
@@ -1310,7 +1349,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_user_session(user_id)
 
     try:
-        await update.message.chat.send_action(action="typing")
+        try:
+            await update.message.chat.send_action(action="typing")
+        except Exception:
+            pass
 
         provider_name, provider = _resolve_provider(session)
         current_model    = session["models"].get(provider_name)   # None = provider default
@@ -1326,7 +1368,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not skip:
             logger.info(f"[Bot] user={user_id} provider={provider_name} → asking AI for search decision")
-            await update.message.chat.send_action(action="typing")
+            try:
+                await update.message.chat.send_action(action="typing")
+            except Exception:
+                pass
             search_query = await ai_decide_search(provider, current_model, session["history"])
             logger.info(f"[Bot] Decision: {'SEARCH: ' + search_query if search_query else 'NOSEARCH'}")
 
@@ -1337,7 +1382,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             engine = session.get("search_engine", "duckduckgo")
             logger.info(f"[Bot] Searching ({engine}): '{search_query}'")
 
-            await update.message.chat.send_action(action="typing")
+            try:
+                await update.message.chat.send_action(action="typing")
+            except Exception:
+                pass
             snippets = await web_search(search_query, engine)
 
             if snippets:
@@ -1346,7 +1394,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 search_msgs.append({"role": "user", "content": user_message + "\n\n" + ctx})
                 search_msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS})
 
-                await update.message.chat.send_action(action="typing")
+                try:
+                    await update.message.chat.send_action(action="typing")
+                except Exception:
+                    pass
                 bot_response = await asyncio.to_thread(
                     provider.chat,
                     messages=search_msgs,
@@ -1410,10 +1461,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if session["history"] and session["history"][-1].get("role") == "user":
             session["history"].pop()
         _, prov = _resolve_provider(session)
-        await update.message.reply_text(
-            f"❌ Error with {prov.get_name()}: {str(e)}\n\n"
-            f"Try:\n• `/clear` to reset conversation\n• `/provider` to switch provider"
-        )
+        try:
+            await update.message.reply_text(
+                f"❌ Error with {prov.get_name()}: {str(e)}\n\n"
+                f"Try:\n• `/clear` to reset conversation\n• `/provider` to switch provider"
+            )
+        except Exception:
+            pass
 
 
 # ============================================================================
