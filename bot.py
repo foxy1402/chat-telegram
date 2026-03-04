@@ -243,6 +243,13 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
         return _parse_search_query(response)
     except Exception as e:
         logger.warning(f"[Bot] Search decision error: {e}")
+        # Fall back to searching with the last user message so we don't silently skip search
+        last_user = next(
+            (m["content"] for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if last_user:
+            logger.warning("[Bot] Search decision failed — falling back to search with user message")
+            return last_user[:200]
         return None
 
 
@@ -928,7 +935,10 @@ def _duckduckgo_search_sync(query: str) -> list:
 
 async def web_search(query: str, engine: str) -> list:
     if engine == "brave" and BRAVE_API_KEY:
-        return await asyncio.to_thread(_brave_search_sync, query)
+        results = await asyncio.to_thread(_brave_search_sync, query)
+        if results:
+            return results
+        logger.warning(f"[Search] Brave returned no results for '{query}' — falling back to DuckDuckGo")
     return await asyncio.to_thread(_duckduckgo_search_sync, query)
 
 
