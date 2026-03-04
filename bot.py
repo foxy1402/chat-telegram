@@ -143,16 +143,6 @@ def _skip_search_decision(text: str) -> bool:
     return text.lower().rstrip('!?.,: ') in _GREETINGS
 
 
-_APOLOGY_PATTERNS = (
-    r"SEARCH:",                                           # doubled output (Cerebras quirk)
-    r"NOSEARCH",                                          # glued NOSEARCH suffix (Cerebras quirk)
-    r"\*",                                               # Markdown separator — model leaking context after query (Cerebras quirk)
-    r"User asks",                                        # model echoing user message inline
-    r"I['\u2019]?m sorry", r"I cannot", r"I don['\u2019]?t", r"I do not",
-    r"I am unable", r"I can['\u2019]?t", r"Please note", r"Note that",
-    r"However,", r"Unfortunately", r"As of my",
-    r"Here is", r"Here are", r"Let me", r"The answer", r"To answer",
-)
 
 
 def _parse_search_query(response: str) -> Optional[str]:
@@ -160,61 +150,41 @@ def _parse_search_query(response: str) -> Optional[str]:
 
     Returns clean query string if AI wants to search, or None if it answered directly.
 
-    Handles all known model quirks:
-    - Doubled output (no newline): 'SEARCH: bitcoin priceSEARCH: bitcoin price'
-      Root cause: Cerebras doubles the entire line without a newline break.
-    - Apology glued inline (no newline): 'SEARCH: current US presidentI'm sorry...'
-      Root cause: small models (Cerebras, some Groq) ignore 'ONLY this line' instruction
-      and append a refusal/apology directly after the query without a newline break.
-    - Quoted queries:     SEARCH: "bitcoin price"
-    - Repeated prefix:   SEARCH: SEARCH: something
-    - Answer appended:   SEARCH: bitcoin price\n\nBitcoin is currently trading...
-    - Period-terminated: SEARCH: who is president. I cannot answer.
-    - Mixed case:        search: / Search:
+    Strategy: after extracting the first line following 'SEARCH:', keep only the
+    leading portion that looks like a valid search query — alphanumeric, spaces,
+    and common query punctuation (hyphen, apostrophe, straight quotes, dots, /).
+    Anything else (*, apology text, leaked context, Markdown) is treated as a
+    natural end-of-query boundary and discarded.  This replaces the old brittle
+    _APOLOGY_PATTERNS list that had to be updated every time a new model quirk appeared.
     """
     stripped = response.strip()
     if not stripped.upper().startswith('SEARCH:'):
         return None
 
-    # Take content after SEARCH: prefix
-    raw = stripped[7:].strip()
+    # Content after SEARCH: prefix; take only the first line
+    raw = stripped[7:].strip().split('\n')[0].strip()
 
-    # Take only the first line — some models append full answer after newline
-    raw = raw.split('\n')[0].strip()
-
-    # Strip surrounding quotes/backticks some models add
-    for q in ('"', "'", '`'):
-        if len(raw) > 2 and raw[0] == q and raw[-1] == q:
-            raw = raw[1:-1].strip()
-
-    # Strip repeated SEARCH: prefix (rare but happens)
+    # Strip repeated SEARCH: prefix (Cerebras doubles the entire output)
     for _ in range(3):
         if raw.upper().startswith('SEARCH:'):
             raw = raw[7:].strip()
         else:
             break
 
-    # Cut at the EARLIEST inline apology/refusal match — models that ignore 'ONLY this line'
-    # sometimes glue apology text directly after the query without any newline.
-    # e.g. "current US presidentI'm sorry, I don't have that information."
-    # Uses minimum-position approach: find earliest match across all patterns, cut once.
-    cut_at = len(raw)
-    for pat in _APOLOGY_PATTERNS:
-        m = re.search(pat, raw, re.IGNORECASE)
-        if m and m.start() < cut_at:
-            cut_at = m.start()
-    raw = raw[:cut_at].strip()
+    # Strip surrounding quotes/backticks some models add
+    for q in ('"', "'", '`'):
+        if len(raw) > 2 and raw[0] == q and raw[-1] == q:
+            raw = raw[1:-1].strip()
 
-    # Cut at sentence boundary — space after punctuation prevents cutting decimals
-    # "3.5mm jack" stays intact; "who is president. I cannot" → "who is president"
-    raw = re.sub(r'[.!?] .*$', '', raw).strip()
-
-    # Strip trailing punctuation and Markdown artifacts (* from bold markers)
-    raw = raw.rstrip('.,!?;:*`').strip()
+    # Keep only the leading valid-query portion.
+    # Valid chars: letters, digits, spaces, - ' " . / & + % @ # ( )
+    # First char outside this set is treated as end-of-query.
+    m = re.match(r"^[\w\s\-'\".,/&+%@#()]+", raw, re.UNICODE)
+    raw = m.group(0).strip() if m else ""
 
     raw = raw[:120]
-    # Require at least 2 chars — a 1-char query is a parsing failure, fall back
     return raw if len(raw) >= 2 else None
+
 
 
 def _build_search_context(query: str, snippets: list) -> str:
@@ -337,6 +307,11 @@ def get_model_capability_score(model_id: str) -> tuple:
 
 class AIProvider(ABC):
 
+    def __init__(self):
+        import threading
+        self._cached_models = None
+        self._models_lock = threading.Lock()
+
     @abstractmethod
     def chat(self, messages: List[Dict], model: Optional[str] = None,
              enable_thinking: bool = False) -> str:
@@ -378,10 +353,10 @@ class AIProvider(ABC):
 class GroqProvider(AIProvider):
 
     def __init__(self, api_key: str):
+        super().__init__()
         from groq import Groq
         self.client = Groq(api_key=api_key)
         self.default_model = 'llama-3.3-70b-versatile'
-        self._cached_models = None
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
              enable_thinking: bool = False) -> str:
@@ -398,21 +373,22 @@ class GroqProvider(AIProvider):
         return response.choices[0].message.content
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models is not None:
-            return self._cached_models
-        try:
-            models_response = self.client.models.list()
-            chat_models = []
-            for model in models_response.data:
-                if model.active and hasattr(model, 'id'):
-                    chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
-            chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
-            self._cached_models = chat_models
-            logger.info(f"✅ Groq: Detected {len(chat_models)} available models")
-            return chat_models
-        except Exception as e:
-            logger.warning(f"⚠️ Groq: Could not fetch models: {e}")
-            return self._get_fallback_models()
+        with self._models_lock:
+            if self._cached_models is not None:
+                return self._cached_models
+            try:
+                models_response = self.client.models.list()
+                chat_models = []
+                for model in models_response.data:
+                    if model.active and hasattr(model, 'id'):
+                        chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
+                chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
+                self._cached_models = chat_models
+                logger.info(f"✅ Groq: Detected {len(chat_models)} available models")
+                return chat_models
+            except Exception as e:
+                logger.warning(f"⚠️ Groq: Could not fetch models: {e}")
+                return self._get_fallback_models()
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -430,11 +406,11 @@ class GroqProvider(AIProvider):
 class GeminiProvider(AIProvider):
 
     def __init__(self, api_key: str):
+        super().__init__()
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         self.genai = genai
         self.default_model = "gemini-1.5-flash"
-        self._cached_models = None
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
              enable_thinking: bool = False) -> str:
@@ -457,25 +433,26 @@ class GeminiProvider(AIProvider):
         return chat.send_message(messages[-1]["content"]).text
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models is not None:
-            return self._cached_models
-        try:
-            chat_models = []
-            for model in self.genai.list_models():
-                if 'generateContent' not in model.supported_generation_methods:
-                    continue
-                model_id = model.name.replace('models/', '')
-                if any(x in model_id.lower() for x in ['vision', 'embedding', 'aqa']):
-                    continue
-                name = model.display_name if hasattr(model, 'display_name') else model_id.replace('-', ' ').title()
-                chat_models.append({"id": model_id, "name": name})
-            chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
-            self._cached_models = chat_models
-            logger.info(f"✅ Gemini: Detected {len(chat_models)} available models")
-            return chat_models
-        except Exception as e:
-            logger.warning(f"⚠️ Gemini: Could not fetch models: {e}")
-            return self._get_fallback_models()
+        with self._models_lock:
+            if self._cached_models is not None:
+                return self._cached_models
+            try:
+                chat_models = []
+                for model in self.genai.list_models():
+                    if 'generateContent' not in model.supported_generation_methods:
+                        continue
+                    model_id = model.name.replace('models/', '')
+                    if any(x in model_id.lower() for x in ['vision', 'embedding', 'aqa']):
+                        continue
+                    name = model.display_name if hasattr(model, 'display_name') else model_id.replace('-', ' ').title()
+                    chat_models.append({"id": model_id, "name": name})
+                chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
+                self._cached_models = chat_models
+                logger.info(f"✅ Gemini: Detected {len(chat_models)} available models")
+                return chat_models
+            except Exception as e:
+                logger.warning(f"⚠️ Gemini: Could not fetch models: {e}")
+                return self._get_fallback_models()
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -492,11 +469,11 @@ class GeminiProvider(AIProvider):
 class OpenRouterProvider(AIProvider):
 
     def __init__(self, api_key: str):
+        super().__init__()
         from openai import OpenAI
         self.client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
         self.api_key = api_key
         self.default_model = "meta-llama/llama-3.3-70b-instruct:free"
-        self._cached_models = None
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
              enable_thinking: bool = False) -> str:
@@ -513,39 +490,40 @@ class OpenRouterProvider(AIProvider):
         return response.choices[0].message.content
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models is not None:
-            return self._cached_models
-        try:
-            response = requests.get(
-                "https://openrouter.ai/api/v1/models",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=5
-            )
-            response.raise_for_status()
-            free_models = []
-            for model in response.json().get('data', []):
-                model_id = model.get('id', '')
-                pricing = model.get('pricing', {})
-                context_length = model.get('context_length', 0)
-                if ':free' not in model_id.lower() or context_length <= 0:
-                    continue
-                try:
-                    prompt_price = float(pricing.get('prompt') or 0)
-                    compl_price  = float(pricing.get('completion') or 0)
-                except (TypeError, ValueError):
-                    continue
-                if prompt_price != 0.0 or compl_price != 0.0:
-                    continue
-                name = model.get('name', model_id)
-                name = name.replace(' (free)', '').replace(' (Free)', '') + " (Free)"
-                free_models.append({"id": model_id, "name": name, "context": context_length})
-            free_models.sort(key=lambda m: get_model_capability_score(m['id']))
-            self._cached_models = free_models[:15]
-            logger.info(f"✅ OpenRouter: Detected {len(self._cached_models)} free models")
-            return self._cached_models
-        except Exception as e:
-            logger.warning(f"⚠️ OpenRouter: Could not fetch models: {e}")
-            return self._get_fallback_models()
+        with self._models_lock:
+            if self._cached_models is not None:
+                return self._cached_models
+            try:
+                response = requests.get(
+                    "https://openrouter.ai/api/v1/models",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=5
+                )
+                response.raise_for_status()
+                free_models = []
+                for model in response.json().get('data', []):
+                    model_id = model.get('id', '')
+                    pricing = model.get('pricing', {})
+                    context_length = model.get('context_length', 0)
+                    if ':free' not in model_id.lower() or context_length <= 0:
+                        continue
+                    try:
+                        prompt_price = float(pricing.get('prompt') or 0)
+                        compl_price  = float(pricing.get('completion') or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if prompt_price != 0.0 or compl_price != 0.0:
+                        continue
+                    name = model.get('name', model_id)
+                    name = name.replace(' (free)', '').replace(' (Free)', '') + " (Free)"
+                    free_models.append({"id": model_id, "name": name, "context": context_length})
+                free_models.sort(key=lambda m: get_model_capability_score(m['id']))
+                self._cached_models = free_models[:15]
+                logger.info(f"✅ OpenRouter: Detected {len(self._cached_models)} free models")
+                return self._cached_models
+            except Exception as e:
+                logger.warning(f"⚠️ OpenRouter: Could not fetch models: {e}")
+                return self._get_fallback_models()
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -563,10 +541,10 @@ class OpenRouterProvider(AIProvider):
 class CerebrasProvider(AIProvider):
 
     def __init__(self, api_key: str):
+        super().__init__()
         from cerebras.cloud.sdk import Cerebras
         self.client = Cerebras(api_key=api_key)
         self.default_model = "gpt-oss-120b"
-        self._cached_models = None
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
              enable_thinking: bool = False) -> str:
@@ -583,20 +561,21 @@ class CerebrasProvider(AIProvider):
         return response.choices[0].message.content
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models is not None:
-            return self._cached_models
-        try:
-            chat_models = []
-            for model in self.client.models.list().data:
-                if hasattr(model, 'id'):
-                    chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
-            chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
-            self._cached_models = chat_models
-            logger.info(f"✅ Cerebras: Detected {len(chat_models)} available models")
-            return chat_models
-        except Exception as e:
-            logger.warning(f"⚠️ Cerebras: Could not fetch models: {e}")
-            return self._get_fallback_models()
+        with self._models_lock:
+            if self._cached_models is not None:
+                return self._cached_models
+            try:
+                chat_models = []
+                for model in self.client.models.list().data:
+                    if hasattr(model, 'id'):
+                        chat_models.append({"id": model.id, "name": model.id.replace('-', ' ').title()})
+                chat_models.sort(key=lambda m: get_model_capability_score(m['id']))
+                self._cached_models = chat_models
+                logger.info(f"✅ Cerebras: Detected {len(chat_models)} available models")
+                return chat_models
+            except Exception as e:
+                logger.warning(f"⚠️ Cerebras: Could not fetch models: {e}")
+                return self._get_fallback_models()
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -619,13 +598,13 @@ class NvidiaProvider(AIProvider):
     }
 
     def __init__(self, api_key: str):
+        super().__init__()
         from openai import OpenAI
         self.client = OpenAI(
             base_url="https://integrate.api.nvidia.com/v1",
             api_key=api_key
         )
         self.default_model = 'openai/gpt-oss-120b'
-        self._cached_models = None
 
     def supports_thinking(self, model_id: str) -> bool:
         return model_id not in self.MODELS_WITHOUT_THINKING
@@ -760,9 +739,10 @@ class ProviderManager:
 provider_manager = ProviderManager()
 user_sessions: Dict[str, Dict] = {}
 
-_SESSION_TTL     = 86400   # evict sessions inactive for >24 h
+_SESSION_TTL      = 86400   # evict sessions inactive for >24 h
 _CLEANUP_INTERVAL = 3600   # run cleanup at most once per hour
 _last_session_cleanup: float = 0.0
+_cleanup_in_progress: bool = False
 
 
 # ============================================================================
@@ -770,18 +750,22 @@ _last_session_cleanup: float = 0.0
 # ============================================================================
 
 def get_user_session(user_id: str) -> Dict:
-    global _last_session_cleanup
+    global _last_session_cleanup, _cleanup_in_progress
     now = time.time()
 
-    # Lazy hourly eviction of inactive sessions
-    if now - _last_session_cleanup > _CLEANUP_INTERVAL:
-        stale = [uid for uid, s in user_sessions.items()
-                 if now - s.get("last_seen", 0) > _SESSION_TTL]
-        for uid in stale:
-            del user_sessions[uid]
-        if stale:
-            logger.info(f"[Session] Evicted {len(stale)} stale session(s)")
-        _last_session_cleanup = now
+    # Lazy hourly eviction of inactive sessions — guard prevents double-entry
+    if not _cleanup_in_progress and now - _last_session_cleanup > _CLEANUP_INTERVAL:
+        _cleanup_in_progress = True
+        try:
+            stale = [uid for uid, s in list(user_sessions.items())
+                     if now - s.get("last_seen", 0) > _SESSION_TTL]
+            for uid in stale:
+                user_sessions.pop(uid, None)
+            if stale:
+                logger.info(f"[Session] Evicted {len(stale)} stale session(s)")
+        finally:
+            _last_session_cleanup = now
+            _cleanup_in_progress = False
 
     if user_id not in user_sessions:
         default_engine = "brave" if (SEARCH_ENGINE == "brave" and BRAVE_API_KEY) else "duckduckgo"
@@ -820,16 +804,29 @@ def _resolve_provider(session: Dict):
 # MODEL VALIDATION CACHE
 # ============================================================================
 
+
+# In-memory cache — single source of truth; disk is persistence only.
+# All add/get operations mutate this dict directly, eliminating the
+# load→modify→save race that occurs when two concurrent /validate runs interleave.
+_validated_cache: Optional[Dict] = None
+
 def load_validated_models() -> Dict:
+    global _validated_cache
+    if _validated_cache is not None:
+        return _validated_cache
     try:
         if os.path.exists(VALIDATED_MODELS_CACHE):
             with open(VALIDATED_MODELS_CACHE, 'r') as f:
-                return json.load(f)
+                _validated_cache = json.load(f)
+                return _validated_cache
     except Exception as e:
         logger.warning(f"Could not load validated models cache: {e}")
-    return {}
+    _validated_cache = {}
+    return _validated_cache
 
 def save_validated_models(validated: Dict):
+    global _validated_cache
+    _validated_cache = validated
     try:
         with open(VALIDATED_MODELS_CACHE, 'w') as f:
             json.dump(validated, f, indent=2)
