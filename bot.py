@@ -158,18 +158,29 @@ def _parse_search_query(response: str) -> Optional[str]:
     _APOLOGY_PATTERNS list that had to be updated every time a new model quirk appeared.
     """
     stripped = response.strip()
-    if not stripped.upper().startswith('SEARCH:'):
-        return None
 
-    # Content after SEARCH: prefix; take only the first line
-    raw = stripped[7:].strip().split('\n')[0].strip()
+    if stripped.upper().startswith('SEARCH:'):
+        raw = stripped[7:].strip().split('\n')[0].strip()
+    else:
+        # Fallback: model added preamble before SEARCH: (e.g. "I'll look that up. SEARCH: query")
+        m = re.search(r'(?i)\bSEARCH:\s*(.+)', stripped)
+        if not m:
+            return None
+        raw = m.group(1).strip().split('\n')[0].strip()
 
-    # Strip repeated SEARCH: prefix (Cerebras doubles the entire output)
-    for _ in range(3):
-        if raw.upper().startswith('SEARCH:'):
-            raw = raw[7:].strip()
-        else:
-            break
+    # Truncate at NOSEARCH keyword if model appends it on the same line
+    # (e.g. Cerebras: "Taylor Swift latest song 2026NOSEARCHSEARCH")
+    # Also recover a new SEARCH: query that follows NOSEARCH inline
+    parts = re.split(r'(?i)NOSEARCH', raw, maxsplit=1)
+    if len(parts) == 2 and re.match(r'(?i)\s*SEARCH:\s*', parts[1]):
+        # Model wrote: "<junk>NOSEARCHSEARCH: real query" — use the part after NOSEARCH
+        raw = re.sub(r'(?i)^SEARCH:\s*', '', parts[1]).strip()
+    else:
+        raw = parts[0].strip()
+
+    # Strip repeated SEARCH: prefix (some models double/triple the entire output)
+    while raw.upper().startswith('SEARCH:'):
+        raw = raw[7:].strip()
 
     # Strip surrounding quotes/backticks some models add
     for q in ('"', "'", '`'):
@@ -181,6 +192,12 @@ def _parse_search_query(response: str) -> Optional[str]:
     # First char outside this set is treated as end-of-query.
     m = re.match(r"^[\w\s\-'\".,/&+%@#()]+", raw, re.UNICODE)
     raw = m.group(0).strip() if m else ""
+
+    # Cap at 10 words to prevent explanatory bleed-through
+    # (prompt requests 2-6 words; 10 gives headroom for longer queries)
+    words = raw.split()
+    if len(words) > 10:
+        raw = ' '.join(words[:10])
 
     raw = raw[:120]
     return raw if len(raw) >= 2 else None
