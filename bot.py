@@ -182,6 +182,12 @@ def _parse_search_query(response: str) -> Optional[str]:
     while raw.upper().startswith('SEARCH:'):
         raw = raw[7:].strip()
 
+    # Truncate at any remaining inline SEARCH: (model echoed query without newline separator)
+    # e.g. "Taylor SwiftSEARCH: Taylor Swift" → "Taylor Swift"
+    m_echo = re.search(r'(?i)SEARCH:', raw)
+    if m_echo:
+        raw = raw[:m_echo.start()].strip()
+
     # Strip surrounding quotes/backticks some models add
     for q in ('"', "'", '`'):
         if len(raw) > 2 and raw[0] == q and raw[-1] == q:
