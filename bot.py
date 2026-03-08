@@ -496,7 +496,7 @@ class OpenRouterProvider(AIProvider):
         from openai import OpenAI
         self.client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
         self.api_key = api_key
-        self.default_model = "meta-llama/llama-3.3-70b-instruct:free"
+        self.default_model = "openrouter/free"
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
              enable_thinking: bool = False) -> str:
