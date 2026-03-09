@@ -9,7 +9,7 @@
 ## ✨ Features
 
 - 🔄 **5 AI Providers** — Groq, Gemini, OpenRouter, Cerebras, NVIDIA
-- 🌐 **Web Search** — AI can search the web for real-time info (Brave API or DuckDuckGo)
+- 🌐 **Web Search** — AI can search the web for real-time info (Brave API, SearXNG, or DuckDuckGo)
 - 💭 **Thinking Mode** — See AI reasoning traces with NVIDIA models
 - ✅ **Model Validation** — Test which models actually work before using them
 - ⚡ **Easy Switching** — Change providers and models with simple commands
@@ -148,7 +148,12 @@ MAX_HISTORY_MESSAGES=20
 # If not set, DuckDuckGo is used (free, no key needed)
 BRAVE_API_KEY=your_brave_api_key
 
-# Engine: "brave" or "duckduckgo" (default: brave)
+# SearXNG self-hosted instance URL (no API key needed)
+# Leave empty if not using SearXNG
+SEARXNG_URL=http://your-searxng-host
+
+# Engine: "brave", "searxng", or "duckduckgo" (default: brave)
+# Falls back to DuckDuckGo if the selected engine returns no results
 SEARCH_ENGINE=brave
 
 # Number of results to fetch (default: 3)
@@ -181,6 +186,7 @@ MAX_SNIPPET_LEN=300
 | `/web on` | Enable web search |
 | `/web off` | Disable web search |
 | `/web brave` | Switch to Brave Search API |
+| `/web searxng` | Switch to SearXNG (self-hosted) |
 | `/web ddg` | Switch to DuckDuckGo (free, no key) |
 
 When web search is enabled, the AI automatically detects when your question needs real-time info (news, current events, live data) and searches the web. Works with any provider.
@@ -298,11 +304,11 @@ Bot: ✅ Verified Models for NVIDIA:
 
 1. **You ask a question** — e.g., "What's the latest iPhone?"
 2. **Bot evaluates search need** — using a lightweight keyword/time heuristic
-3. **If needed, bot searches directly** — Using Brave API or DuckDuckGo
+3. **If needed, bot searches directly** — Using Brave API, SearXNG, or DuckDuckGo
 4. **Bot sends your question + snippets to AI** — in one answer pass
 5. **AI returns an up-to-date response** — grounded in the fetched snippets
 
-You can use `/web off` to disable this entirely, or `/web ddg` to use the free DuckDuckGo engine without any API key.
+You can use `/web off` to disable this entirely, `/web searxng` to use your self-hosted SearXNG instance, or `/web ddg` to use the free DuckDuckGo engine without any API key.
 
 ---
 
@@ -325,6 +331,7 @@ You can use `/web off` to disable this entirely, or `/web ddg` to use the free D
 ### Web search not working
 - Check if web search is enabled: `/web`
 - For Brave: ensure `BRAVE_API_KEY` is set
+- For SearXNG: ensure `SEARXNG_URL` is set and the instance has JSON format enabled
 - Try DuckDuckGo (no key needed): `/web ddg`
 
 ### Models not loading

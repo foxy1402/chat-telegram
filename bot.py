@@ -39,8 +39,9 @@ except ValueError:
 MAX_MESSAGE_LENGTH = 4096
 
 # Web Search Configuration
-BRAVE_API_KEY = os.getenv('BRAVE_API_KEY', '')
-SEARCH_ENGINE = os.getenv('SEARCH_ENGINE', 'brave').lower()
+BRAVE_API_KEY  = os.getenv('BRAVE_API_KEY', '')
+SEARXNG_URL    = os.getenv('SEARXNG_URL', '').rstrip('/')   # e.g. http://searxng.example.com
+SEARCH_ENGINE  = os.getenv('SEARCH_ENGINE', 'brave').lower()
 try:
     MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '3'))
 except ValueError:
@@ -791,7 +792,12 @@ def get_user_session(user_id: str) -> Dict:
             _cleanup_in_progress = False
 
     if user_id not in user_sessions:
-        default_engine = "brave" if (SEARCH_ENGINE == "brave" and BRAVE_API_KEY) else "duckduckgo"
+        if SEARCH_ENGINE == "searxng" and SEARXNG_URL:
+            default_engine = "searxng"
+        elif SEARCH_ENGINE == "brave" and BRAVE_API_KEY:
+            default_engine = "brave"
+        else:
+            default_engine = "duckduckgo"
         user_sessions[user_id] = {
             "provider":         provider_manager.get_default_provider(),
             "models":           {},
@@ -964,7 +970,35 @@ def _duckduckgo_search_sync(query: str) -> list:
         logger.error(f"[Search] DDG error: {e}")
         return []
 
+def _searxng_search_sync(query: str) -> list:
+    if not SEARXNG_URL:
+        return []
+    q = urllib.parse.quote_plus(query)
+    try:
+        r = requests.get(
+            f"{SEARXNG_URL}/search",
+            params={"q": query, "format": "json", "count": MAX_SEARCH_RESULTS},
+            headers={"Accept": "application/json"},
+            timeout=10)
+        r.raise_for_status()
+        snippets = []
+        for item in r.json().get("results", [])[:MAX_SEARCH_RESULTS]:
+            title   = item.get("title", "")
+            content = item.get("content", "")[:MAX_SNIPPET_LEN]
+            if title or content:
+                snippets.append(f"{title}: {content}")
+        logger.info(f"[Search] SearXNG '{query}' -> {len(snippets)} results")
+        return snippets
+    except Exception as e:
+        logger.error(f"[Search] SearXNG error: {e}")
+        return []
+
 async def web_search(query: str, engine: str) -> list:
+    if engine == "searxng" and SEARXNG_URL:
+        results = await asyncio.to_thread(_searxng_search_sync, query)
+        if results:
+            return results
+        logger.warning(f"[Search] SearXNG returned no results for '{query}' — falling back to DuckDuckGo")
     if engine == "brave" and BRAVE_API_KEY:
         results = await asyncio.to_thread(_brave_search_sync, query)
         if results:
@@ -1038,6 +1072,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/web` — show status\n"
         "• `/web on` / `/web off` — toggle\n"
         "• `/web brave` — Brave Search API\n"
+        "• `/web searxng` — SearXNG (self-hosted)\n"
         "• `/web ddg` — DuckDuckGo (free)\n\n"
         "*Model Validation:*\n"
         "• `/validate` — test which models work\n"
@@ -1320,11 +1355,14 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         status = "ON" if session.get("web_search") else "OFF"
         eng = session.get("search_engine", "duckduckgo")
+        eng_label = {"brave": "Brave API", "searxng": "SearXNG", "duckduckgo": "DuckDuckGo"}.get(eng, eng)
+        searxng_line = f"`/web searxng` — SearXNG (self-hosted)\n" if SEARXNG_URL else ""
         await update.message.reply_text(
             f"🌐 *Web Search:* {status}\n"
-            f"🔍 *Engine:* {'Brave API' if eng == 'brave' else 'DuckDuckGo'}\n\n"
+            f"🔍 *Engine:* {eng_label}\n\n"
             f"Use: `/web on` | `/web off`\n"
             f"`/web brave` — Brave Search API\n"
+            f"{searxng_line}"
             f"`/web ddg` — DuckDuckGo (free)",
             parse_mode='Markdown'
         )
@@ -1333,9 +1371,8 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if arg == "on":
         session["web_search"] = True
         eng = session.get("search_engine", "duckduckgo")
-        await update.message.reply_text(
-            f"✅ Web search enabled ({'Brave' if eng == 'brave' else 'DuckDuckGo'})."
-        )
+        eng_label = {"brave": "Brave", "searxng": "SearXNG", "duckduckgo": "DuckDuckGo"}.get(eng, eng)
+        await update.message.reply_text(f"✅ Web search enabled ({eng_label}).")
     elif arg == "off":
         session["web_search"] = False
         await update.message.reply_text("🔕 Web search disabled.")
@@ -1351,8 +1388,15 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["search_engine"] = "duckduckgo"
         session["web_search"] = True
         await update.message.reply_text("✅ Switched to DuckDuckGo (free).")
+    elif arg == "searxng":
+        if not SEARXNG_URL:
+            await update.message.reply_text("❌ SEARXNG_URL not configured.", parse_mode='Markdown')
+        else:
+            session["search_engine"] = "searxng"
+            session["web_search"] = True
+            await update.message.reply_text("✅ Switched to SearXNG.")
     else:
-        await update.message.reply_text("❌ Use: `/web on|off|brave|ddg`", parse_mode='Markdown')
+        await update.message.reply_text("❌ Use: `/web on|off|brave|searxng|ddg`", parse_mode='Markdown')
 
 
 # ============================================================================
