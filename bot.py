@@ -145,7 +145,6 @@ def _skip_search_decision(text: str) -> bool:
 
 
 
-
 def _parse_search_query(response: str) -> Optional[str]:
     """Extract SEARCH: query from AI search-decision response.
 
@@ -220,7 +219,7 @@ def _build_search_context(query: str, snippets: list) -> str:
     return '\n'.join(parts)
 
 
-_SEARCH_DECISION_RETRIES = 2
+_SEARCH_DECISION_RETRIES = 3
 _SEARCH_DECISION_RETRY_DELAY = 1.0  # seconds between retries
 
 async def ai_decide_search(provider, model: Optional[str], messages: list) -> Optional[str]:
@@ -229,6 +228,9 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
     Uses a standalone router system prompt (not the main assistant prompt).
     Passes full conversation history so the AI has context for multi-turn exchanges.
     Retries up to _SEARCH_DECISION_RETRIES times on empty/failed responses.
+
+    On total failure, optimistically searches using the raw user message rather than
+    silently falling back to NOSEARCH.
     Returns a clean search query string, or None to answer directly.
     """
     decision_msgs = [{"role": "system", "content": _make_search_decision_prompt()}]
@@ -245,7 +247,6 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
             ) or ""
             if response.strip():
                 return _parse_search_query(response)
-            # Empty response — treat as a transient failure and retry
             logger.warning(f"[Bot] Search decision attempt {attempt}: empty response, retrying...")
         except Exception as e:
             last_error = e
@@ -253,8 +254,22 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
         if attempt < _SEARCH_DECISION_RETRIES:
             await asyncio.sleep(_SEARCH_DECISION_RETRY_DELAY)
 
-    logger.warning(f"[Bot] Search decision failed after {_SEARCH_DECISION_RETRIES} attempts "
-                   f"({last_error or 'empty response'}) — falling back to NOSEARCH")
+    fallback_query = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"),
+        None,
+    )
+    if fallback_query:
+        fallback_query = fallback_query[:80].strip()
+        logger.warning(
+            f"[Bot] Search decision failed after {_SEARCH_DECISION_RETRIES} attempts "
+            f"({last_error or 'empty response'}) — optimistic fallback SEARCH: '{fallback_query}'"
+        )
+        return fallback_query
+
+    logger.warning(
+        f"[Bot] Search decision failed after {_SEARCH_DECISION_RETRIES} attempts "
+        f"({last_error or 'empty response'}) — no user message found, falling back to NOSEARCH"
+    )
     return None
 
 
