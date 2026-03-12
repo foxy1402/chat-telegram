@@ -37,6 +37,7 @@ try:
 except ValueError:
     MAX_HISTORY_MESSAGES = 20
 MAX_MESSAGE_LENGTH = 4096
+MAX_INPUT_LENGTH   = 4000  # Reject user messages above this to protect memory and API costs
 
 # Web Search Configuration
 BRAVE_API_KEY  = os.getenv('BRAVE_API_KEY', '')
@@ -274,6 +275,55 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
 
 
 # ============================================================================
+# TRANSIENT API RETRY
+# ============================================================================
+
+_TRANSIENT_ERROR_KEYWORDS = (
+    'rate limit', 'too many requests', '429',
+    'timeout', 'timed out',
+    '503', '502', '500', '529',
+    'overloaded', 'temporarily unavailable', 'service unavailable',
+    'connection error', 'connection reset',
+)
+_CHAT_MAX_RETRIES    = 2
+_CHAT_RETRY_BASE_DELAY = 3.0  # seconds; doubles each attempt (3s, 6s)
+
+
+async def _chat_with_retry(
+    provider,
+    messages: list,
+    model: Optional[str],
+    enable_thinking: bool,
+) -> str:
+    """Call provider.chat() with automatic retry on transient errors.
+
+    Retries up to _CHAT_MAX_RETRIES times with exponential backoff.
+    Non-transient errors (bad model, auth failures, etc.) raise immediately.
+    """
+    for attempt in range(1, _CHAT_MAX_RETRIES + 2):
+        try:
+            return await asyncio.to_thread(
+                provider.chat,
+                messages=messages,
+                model=model,
+                enable_thinking=enable_thinking,
+            ) or ""
+        except Exception as e:
+            if attempt > _CHAT_MAX_RETRIES:
+                raise
+            error_lower = str(e).lower()
+            if not any(kw in error_lower for kw in _TRANSIENT_ERROR_KEYWORDS):
+                raise  # Permanent error — don't retry
+            delay = _CHAT_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning(
+                f"[Bot] Transient API error (attempt {attempt}/{_CHAT_MAX_RETRIES + 1}): "
+                f"{e} — retrying in {delay:.0f}s"
+            )
+            await asyncio.sleep(delay)
+    return ""  # unreachable, satisfies type checker
+
+
+# ============================================================================
 # HISTORY UTILITIES
 # ============================================================================
 
@@ -291,7 +341,10 @@ def _trim_history(history: list) -> list:
 
 
 async def reply_text_safe(message, text: str):
-    """Send Markdown first for better chat UI, fallback to plain text on parse error."""
+    """Send Markdown first for better chat UI, fallback to plain text on parse error.
+
+    Re-raises if both sends fail so callers can roll back history / notify the user.
+    """
     try:
         await message.reply_text(text, parse_mode='Markdown')
     except Exception:
@@ -299,6 +352,7 @@ async def reply_text_safe(message, text: str):
             await message.reply_text(text)
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
+            raise
 
 
 # ============================================================================
@@ -940,9 +994,9 @@ def _brave_search_sync(query: str) -> list:
         r.raise_for_status()
         snippets = []
         for item in r.json().get("web", {}).get("results", []):
-            title = item.get("title", "")
-            desc  = item.get("description", "")[:MAX_SNIPPET_LEN]
-            if title or desc:
+            title = item.get("title", "").strip()
+            desc  = item.get("description", "").strip()[:MAX_SNIPPET_LEN]
+            if title and len(desc) >= 15:
                 snippets.append(f"{title}: {desc}")
         logger.info(f"[Search] Brave '{query}' -> {len(snippets)} results")
         return snippets
@@ -976,7 +1030,7 @@ def _duckduckgo_search_sync(query: str) -> list:
                     if end == -1: end = html_text.find('</td>', se + 1)
                     if end != -1:
                         desc = _strip_tags(html_text[se + 1:end])[:MAX_SNIPPET_LEN]
-            if title:
+            if title and len(desc.strip()) >= 15:
                 snippets.append(f"{title}: {desc}")
             pos = title_end + 1
         logger.info(f"[Search] DDG '{query}' -> {len(snippets)} results")
@@ -998,9 +1052,9 @@ def _searxng_search_sync(query: str) -> list:
         r.raise_for_status()
         snippets = []
         for item in r.json().get("results", [])[:MAX_SEARCH_RESULTS]:
-            title   = item.get("title", "")
-            content = item.get("content", "")[:MAX_SNIPPET_LEN]
-            if title or content:
+            title   = item.get("title", "").strip()
+            content = item.get("content", "").strip()[:MAX_SNIPPET_LEN]
+            if title and len(content) >= 15:
                 snippets.append(f"{title}: {content}")
         logger.info(f"[Search] SearXNG '{query}' -> {len(snippets)} results")
         return snippets
@@ -1445,8 +1499,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     if not user_message:
         return
+    if len(user_message) > MAX_INPUT_LENGTH:
+        await update.message.reply_text(
+            f"❌ Message too long ({len(user_message):,} chars). "
+            f"Please keep it under {MAX_INPUT_LENGTH:,} characters."
+        )
+        return
 
     session = get_user_session(user_id)
+    assistant_appended = False
 
     try:
         try:
@@ -1498,31 +1559,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.chat.send_action(action="typing")
                 except Exception:
                     pass
-                bot_response = await asyncio.to_thread(
-                    provider.chat,
+                bot_response = await _chat_with_retry(
+                    provider,
                     messages=search_msgs,
                     model=current_model,
                     enable_thinking=thinking_enabled,
-                ) or ""
+                )
             else:
                 logger.warning("[Bot] Search returned no results — falling back to direct AI")
-                bot_response = await asyncio.to_thread(
-                    provider.chat,
+                bot_response = await _chat_with_retry(
+                    provider,
                     messages=session["history"],
                     model=current_model,
                     enable_thinking=thinking_enabled,
-                ) or ""
+                )
 
         # ── NO-SEARCH PATH ────────────────────────────────────────────────
         else:
             if skip:
                 logger.info(f"[Bot] user={user_id} provider={provider_name} → quick-filter skip, direct AI call")
-            bot_response = await asyncio.to_thread(
-                provider.chat,
+            bot_response = await _chat_with_retry(
+                provider,
                 messages=session["history"],
                 model=current_model,
                 enable_thinking=thinking_enabled,
-            ) or ""
+            )
 
         # ── Fallback for empty response ────────────────────────────────────
         if not bot_response.strip():
@@ -1530,6 +1591,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Update history ─────────────────────────────────────────────────
         session["history"].append({"role": "assistant", "content": bot_response})
+        assistant_appended = True
         _trim_history(session["history"])
 
         # ── Send response (handle 4096 char limit) ─────────────────────────
@@ -1557,7 +1619,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error in handle_message: {e}", exc_info=True)
-        # Roll back orphaned user message
+        # Roll back the incomplete exchange so history stays consistent.
+        # Assistant message first (innermost), then user message.
+        if assistant_appended and session["history"] and session["history"][-1].get("role") == "assistant":
+            session["history"].pop()
         if session["history"] and session["history"][-1].get("role") == "user":
             session["history"].pop()
         _, prov = _resolve_provider(session)
