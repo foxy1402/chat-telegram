@@ -25,9 +25,9 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ALLOWED_USER_IDS = [uid.strip() for uid in os.getenv('ALLOWED_USER_IDS', '').split(',') if uid.strip()]
 DEFAULT_PROVIDER = os.getenv('DEFAULT_PROVIDER', 'groq')
 try:
-    MAX_TOKENS = int(os.getenv('MAX_TOKENS', '512'))
+    MAX_TOKENS = int(os.getenv('MAX_TOKENS', '1024'))
 except ValueError:
-    MAX_TOKENS = 512
+    MAX_TOKENS = 1024
 try:
     TEMPERATURE = float(os.getenv('TEMPERATURE', '0.7'))
 except ValueError:
@@ -739,11 +739,12 @@ class NvidiaProvider(AIProvider):
             return response.choices[0].message.content
 
     def get_available_models(self) -> List[Dict[str, str]]:
-        if self._cached_models:
+        with self._models_lock:
+            if self._cached_models:
+                return self._cached_models
+            self._cached_models = self._get_fallback_models()
+            logger.info(f"✅ NVIDIA: Using {len(self._cached_models)} hand-picked models")
             return self._cached_models
-        self._cached_models = self._get_fallback_models()
-        logger.info(f"✅ NVIDIA: Using {len(self._cached_models)} hand-picked models")
-        return self._cached_models
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
@@ -1042,7 +1043,6 @@ def _duckduckgo_search_sync(query: str) -> list:
 def _searxng_search_sync(query: str) -> list:
     if not SEARXNG_URL:
         return []
-    q = urllib.parse.quote_plus(query)
     try:
         r = requests.get(
             f"{SEARXNG_URL}/search",
