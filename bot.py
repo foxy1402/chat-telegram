@@ -1,5 +1,8 @@
 import os
 import re
+import io
+import gc
+import base64
 import time
 import logging
 import json
@@ -58,6 +61,13 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 CEREBRAS_API_KEY = os.getenv('CEREBRAS_API_KEY')
 NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY')
+
+# Vision / OCR Configuration
+NVIDIA_VISION_MODEL = os.getenv('NVIDIA_VISION_MODEL', 'google/gemma-3-27b-it')
+try:
+    MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', str(15 * 1024 * 1024)))  # 15 MB
+except ValueError:
+    MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
 # Model validation cache file
 VALIDATED_MODELS_CACHE = os.path.join(os.path.dirname(__file__), 'validated_models.json')
@@ -1093,7 +1103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📡 Current Provider: *{provider.get_name()}*\n"
         f"🔧 Available Providers: {', '.join(provider_manager.list_providers())}\n"
         f"🌐 Web Search: {web_status}\n\n"
-        f"Just send me a message!\n\n"
+        f"Just send me a message or a photo!\n\n"
         f"*Commands:*\n"
         f"/provider - Switch AI provider\n"
         f"/models - List available models\n"
@@ -1149,6 +1159,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/clearvalidation` — clear cache\n\n"
         "*Thinking Mode (NVIDIA only):*\n"
         "• `/thinking on` / `/thinking off`\n\n"
+        "*Image OCR:*\n"
+        "• Send any photo — text is extracted via NVIDIA vision\n"
+        "• Add a caption to ask a specific question about the image\n"
+        "• Requires `NVIDIA_API_KEY` to be set\n\n"
         "*Other:*\n"
         "• `/clear` — clear conversation history\n"
         "• `/help` — this message",
@@ -1636,6 +1650,301 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
+# IMAGE OCR — NVIDIA vision API, fully in-memory (no disk)
+#
+# SINGLE PHOTO FLOW:
+#   Telegram photo → BytesIO (RAM) → base64 → NVIDIA streaming API → reply
+#
+# ALBUM (multi-photo) FLOW:
+#   Telegram sends each photo as a separate Update sharing a media_group_id.
+#   Each update is buffered for _MEDIA_GROUP_WAIT seconds. Once the window
+#   closes, all photos are processed sequentially and one combined reply is
+#   sent. RAM is freed after every individual photo — only one photo lives
+#   in memory at a time even for large albums.
+# ============================================================================
+
+_NVIDIA_VISION_URL  = "https://integrate.api.nvidia.com/v1/chat/completions"
+_MEDIA_GROUP_WAIT   = 1.5   # seconds to collect all photos in an album
+_OCR_MAX_RETRIES    = 2     # retry the NVIDIA API call up to 2 extra times
+_OCR_RETRY_BASE_DELAY = 3.0 # seconds; doubles each attempt (3s, 6s)
+_DEFAULT_OCR_PROMPT = (
+    "Extract and transcribe ALL text visible in this image exactly as written. "
+    "If there is no text, describe the image content concisely."
+)
+
+# {media_group_id: {"photos": [...], "message": msg, "prompt": str,
+#                   "user_id": str, "session": dict}}
+_media_group_buffer: Dict[str, dict] = {}
+# {media_group_id: asyncio.Task}  — one flush task per in-flight album
+_media_group_tasks:  Dict[str, "asyncio.Task[None]"] = {}
+
+
+def _nvidia_vision_sync(b64_data: str, prompt: str) -> str:
+    """Blocking NVIDIA vision call. Runs inside asyncio.to_thread — never call directly."""
+    headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Accept": "text/event-stream",
+    }
+    payload = {
+        "model": NVIDIA_VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.20,
+        "top_p": 0.70,
+        "stream": True,
+    }
+    response = requests.post(_NVIDIA_VISION_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+
+    parts = []
+    for line in response.iter_lines():
+        if not line:
+            continue
+        line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+        if line_str.startswith("data: "):
+            line_str = line_str[6:]
+        if line_str.strip() == "[DONE]":
+            break
+        try:
+            chunk = json.loads(line_str)
+            content = chunk["choices"][0]["delta"].get("content")
+            if content:
+                parts.append(content)
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+    return "".join(parts)
+
+
+async def _ocr_one_photo(context, photo_obj, prompt: str, user_id: str) -> str:
+    """Download a single Telegram photo to RAM, OCR it, return result text.
+
+    The NVIDIA API call is retried up to _OCR_MAX_RETRIES times on transient
+    errors (rate limit, timeout, 5xx). The base64 string is kept in memory
+    across retries so the image is never re-downloaded. Both raw bytes and
+    the base64 string are deleted in the finally block regardless of outcome.
+    """
+    buf: Optional[io.BytesIO] = None
+    b64_str: Optional[str] = None
+    try:
+        # ── Download to RAM ───────────────────────────────────────────────
+        tg_file = await context.bot.get_file(photo_obj.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        logger.info(f"[OCR] user={user_id} size={buf.tell()/1024:.1f} KB model={NVIDIA_VISION_MODEL}")
+
+        # ── Encode once; free raw bytes immediately ───────────────────────
+        b64_str = base64.b64encode(buf.getvalue()).decode()
+        buf.close()
+        del buf
+        buf = None
+
+        # ── API call with retry ───────────────────────────────────────────
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _OCR_MAX_RETRIES + 2):
+            try:
+                result = await asyncio.to_thread(_nvidia_vision_sync, b64_str, prompt)
+                if result.strip():
+                    return result.strip()
+                # Empty response — treat as transient and retry
+                logger.warning(f"[OCR] attempt {attempt}: empty response from model, retrying...")
+            except Exception as e:
+                last_error = e
+                error_lower = str(e).lower()
+                if not any(kw in error_lower for kw in _TRANSIENT_ERROR_KEYWORDS):
+                    raise  # Permanent error (bad key, invalid model, etc.) — fail immediately
+                logger.warning(f"[OCR] attempt {attempt} transient error: {e}")
+
+            if attempt <= _OCR_MAX_RETRIES:
+                delay = _OCR_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(f"[OCR] retrying in {delay:.0f}s...")
+                await asyncio.sleep(delay)
+
+        if last_error:
+            raise last_error
+        return "⚠️ The model returned an empty response after retries. Try a clearer image."
+    finally:
+        if buf is not None:
+            try:
+                buf.close()
+            except Exception:
+                pass
+            del buf
+        if b64_str is not None:
+            del b64_str
+        gc.collect()
+
+
+async def _send_ocr_reply(message, text: str):
+    """Send OCR text, splitting at Telegram's 4096-char limit if needed."""
+    if len(text) <= MAX_MESSAGE_LENGTH:
+        await reply_text_safe(message, text)
+        return
+    chunk_limit = MAX_MESSAGE_LENGTH - 25
+    chunks, current_chunk = [], ""
+    for line in text.split('\n'):
+        if len(line) > chunk_limit:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            for j in range(0, len(line), chunk_limit):
+                chunks.append(line[j:j + chunk_limit])
+            continue
+        if len(current_chunk) + len(line) + 1 > chunk_limit:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = line
+        else:
+            current_chunk = (current_chunk + '\n' + line) if current_chunk else line
+    if current_chunk:
+        chunks.append(current_chunk)
+    for i, chunk in enumerate(chunks, 1):
+        header = f"📄 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
+        await reply_text_safe(message, header + chunk)
+
+
+async def _flush_media_group(group_id: str, context):
+    """Wait for the album collection window, then OCR all photos and send one reply."""
+    await asyncio.sleep(_MEDIA_GROUP_WAIT)
+
+    entry = _media_group_buffer.pop(group_id, None)
+    _media_group_tasks.pop(group_id, None)
+    if not entry:
+        return
+
+    photos   = entry["photos"]
+    message  = entry["message"]
+    prompt   = entry["prompt"]
+    user_id  = entry["user_id"]
+    session  = entry["session"]
+    total    = len(photos)
+
+    logger.info(f"[OCR] album {group_id}: processing {total} photo(s) for user={user_id}")
+
+    try:
+        await message.chat.send_action(action="typing")
+    except Exception:
+        pass
+
+    results = []
+    for idx, photo in enumerate(photos, 1):
+        try:
+            await message.chat.send_action(action="typing")
+        except Exception:
+            pass
+        logger.info(f"[OCR] album photo {idx}/{total}")
+        try:
+            result = await _ocr_one_photo(context, photo, prompt, user_id)
+        except Exception as e:
+            logger.error(f"[OCR] album photo {idx} failed: {e}", exc_info=True)
+            result = f"⚠️ Failed to process image {idx}: {e}"
+        results.append(result)
+
+    # Build combined reply — single photo gets no wrapper, album gets numbered sections
+    if total == 1:
+        combined = results[0]
+    else:
+        sections = [f"*Image {i}/{total}*\n{r}" for i, r in enumerate(results, 1)]
+        combined = "\n\n---\n\n".join(sections)
+
+    # Store a text-only placeholder in history (no base64 ever enters history)
+    session["history"].append({"role": "user", "content": f"[{total} image(s)] {prompt}"})
+    session["history"].append({"role": "assistant", "content": combined})
+    _trim_history(session["history"])
+
+    try:
+        await _send_ocr_reply(message, combined)
+    except Exception as e:
+        logger.error(f"[OCR] Failed to send album reply: {e}", exc_info=True)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_user_allowed(user_id):
+        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        return
+
+    if not NVIDIA_API_KEY:
+        await update.message.reply_text(
+            "❌ Image OCR requires `NVIDIA_API_KEY` to be configured.",
+            parse_mode='Markdown'
+        )
+        return
+
+    photo = update.message.photo[-1]  # largest resolution variant
+    prompt = (update.message.caption.strip() if update.message.caption else _DEFAULT_OCR_PROMPT)
+
+    if photo.file_size and photo.file_size > MAX_IMAGE_BYTES:
+        await update.message.reply_text(
+            f"❌ Image too large ({photo.file_size // 1024:,} KB). "
+            f"Max allowed: {MAX_IMAGE_BYTES // 1024 // 1024} MB."
+        )
+        return
+
+    session   = get_user_session(user_id)
+    group_id  = update.message.media_group_id  # None for single photos
+
+    # ── ALBUM: buffer and schedule a flush task ───────────────────────────
+    if group_id is not None:
+        if group_id not in _media_group_buffer:
+            _media_group_buffer[group_id] = {
+                "photos":  [],
+                "message": update.message,
+                "prompt":  prompt,
+                "user_id": user_id,
+                "session": session,
+            }
+            _media_group_tasks[group_id] = asyncio.create_task(
+                _flush_media_group(group_id, context)
+            )
+        # Telegram only attaches the caption to the first photo in a group;
+        # update prompt if this message carries one.
+        if update.message.caption:
+            _media_group_buffer[group_id]["prompt"] = prompt
+        _media_group_buffer[group_id]["photos"].append(photo)
+        logger.info(
+            f"[OCR] buffered photo {len(_media_group_buffer[group_id]['photos'])} "
+            f"for album {group_id} user={user_id}"
+        )
+        return
+
+    # ── SINGLE PHOTO: process immediately ────────────────────────────────
+    try:
+        await update.message.chat.send_action(action="typing")
+    except Exception:
+        pass
+
+    try:
+        result = await _ocr_one_photo(context, photo, prompt, user_id)
+
+        session["history"].append({"role": "user", "content": f"[image] {prompt}"})
+        session["history"].append({"role": "assistant", "content": result})
+        _trim_history(session["history"])
+
+        await _send_ocr_reply(update.message, result)
+
+    except Exception as e:
+        logger.error(f"[OCR] Error for user={user_id}: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(
+                f"❌ Failed to process image: {str(e)}\n\n"
+                f"Make sure `NVIDIA_API_KEY` is valid and model `{NVIDIA_VISION_MODEL}` is accessible."
+            )
+        except Exception:
+            pass
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -1659,10 +1968,15 @@ def main():
     application.add_handler(CommandHandler("clearvalidation", clearvalidation_command))
     application.add_handler(CommandHandler("thinking",        thinking_command))
     application.add_handler(CommandHandler("web",             web_command))
+    application.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🚀 Multi-Provider AI Bot started!")
     logger.info(f"📡 Providers: {', '.join(provider_manager.list_providers())}")
+    if NVIDIA_API_KEY:
+        logger.info(f"🖼️  Image OCR enabled — model: {NVIDIA_VISION_MODEL}")
+    else:
+        logger.info("🖼️  Image OCR disabled — set NVIDIA_API_KEY to enable")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

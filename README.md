@@ -9,12 +9,13 @@
 ## ✨ Features
 
 - 🔄 **5 AI Providers** — Groq, Gemini, OpenRouter, Cerebras, NVIDIA
+- 🖼️ **Image OCR** — Send any photo and the bot extracts text or describes content via NVIDIA vision models
 - 🌐 **Web Search** — AI can search the web for real-time info (Brave API, SearXNG, or DuckDuckGo)
 - 💭 **Thinking Mode** — See AI reasoning traces with NVIDIA models
 - ✅ **Model Validation** — Test which models actually work before using them
 - ⚡ **Easy Switching** — Change providers and models with simple commands
 - 🔒 **User Whitelisting** — Restrict access to specific Telegram users
-- 💬 **Conversation History** — Context maintained across messages
+- 💬 **Conversation History** — Context maintained across messages (including after OCR)
 - 🆓 **100% Free** — Uses only free-tier APIs (no credit card required)
 - 🐳 **Docker Ready** — Pre-built image on GitHub Container Registry (GHCR)
 
@@ -141,6 +142,21 @@ TEMPERATURE=0.7
 MAX_HISTORY_MESSAGES=20
 ```
 
+### Image OCR
+
+OCR requires `NVIDIA_API_KEY`. All image processing is done fully in-memory — no files are written to disk.
+
+```env
+# Vision model used for image OCR (default: google/gemma-3-27b-it)
+# Other good options: meta/llama-3.2-11b-vision-instruct
+#                     meta/llama-3.2-90b-vision-instruct
+#                     microsoft/phi-3.5-vision-instruct
+NVIDIA_VISION_MODEL=google/gemma-3-27b-it
+
+# Maximum image size accepted (default: 15728640 = 15 MB)
+MAX_IMAGE_BYTES=15728640
+```
+
 ### Web Search
 
 ```env
@@ -201,6 +217,21 @@ When web search is enabled, the AI automatically detects when your question need
 
 Validation results are cached to disk (`validated_models.json`) and persist across restarts. Smart validation skips already-tested models.
 
+### Image OCR 🖼️
+
+Just send a photo — no commands needed.
+
+| Action | Result |
+|--------|--------|
+| Send a photo (no caption) | Extracts and transcribes all visible text |
+| Send a photo with a caption | Uses your caption as the question/prompt |
+| Send multiple photos at once | Processes all photos and replies once with numbered results |
+
+- Requires `NVIDIA_API_KEY` to be set
+- The OCR result is stored in conversation history as plain text, so you can ask follow-up questions about the content without re-uploading the image
+- Failed photos in a multi-photo upload are reported inline; remaining photos still process
+- The vision model can be changed via the `NVIDIA_VISION_MODEL` env var
+
 ### Thinking Mode 💭 (NVIDIA Only)
 
 | Command | Description |
@@ -258,6 +289,45 @@ Bot: 💭 **Thinking:**
      Quantum computing uses qubits instead of classical bits...
 ```
 
+### Image OCR — Single Photo
+```
+You: [sends a photo of a receipt]
+Bot: Receipt — SM Supermarket
+     Milk 1L        ₱85.00
+     Eggs (12pcs)   ₱120.00
+     Bread          ₱55.00
+     Total          ₱260.00
+
+You: what's the total amount?
+Bot: The total is ₱260.00.
+```
+
+### Image OCR — Photo with Caption
+```
+You: [sends a photo of a menu] what's the most expensive dish?
+Bot: The most expensive dish is the Wagyu Beef Steak at ₱1,850.
+```
+
+### Image OCR — Multiple Photos
+```
+You: [sends 3 photos of a menu album]
+Bot: *Image 1/3*
+     Starters: Spring Rolls ₱120, Calamari ₱150...
+
+     ---
+
+     *Image 2/3*
+     Mains: Beef Adobo ₱280, Sinigang ₱320...
+
+     ---
+
+     *Image 3/3*
+     Desserts: Halo-halo ₱150, Leche Flan ₱90...
+
+You: what does the Sinigang taste like?
+Bot: Sinigang is a Filipino sour soup with a tamarind-based broth...
+```
+
 ### Web Search
 ```
 You: /web on
@@ -294,9 +364,25 @@ Bot: ✅ Verified Models for NVIDIA:
 |----------|-------------|----------|-------|------------------|
 | **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ | — |
 | **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ | — |
-| **NVIDIA** | Free tier | Thinking models | ⚡⚡⚡⚡ | 💭 Reasoning mode |
+| **NVIDIA** | Free tier | Thinking + vision | ⚡⚡⚡⚡ | 💭 Reasoning mode, 🖼️ Image OCR |
 | **Gemini** | 100–1,000 | Quality responses | ⚡⚡⚡ | — |
 | **OpenRouter** | 50–1,000 | Model variety | ⚡⚡ | — |
+
+---
+
+## 🖼️ How Image OCR Works
+
+1. **You send a photo** (with or without a caption)
+2. **Bot downloads it to RAM** — no files written to disk, ever
+3. **Raw bytes are base64-encoded** then the raw buffer is freed immediately
+4. **NVIDIA vision API is called** with the encoded image and your prompt (or the default OCR prompt)
+5. **Response is streamed back**, parsed, and sent as a Telegram message
+6. **Base64 string is deleted** and `gc.collect()` is called — memory fully reclaimed
+7. **OCR result is stored in conversation history as plain text** — you can ask follow-up questions about the content in the same chat without re-uploading
+
+For **multi-photo uploads** (albums): Telegram sends each photo as a separate event. The bot collects them for 1.5 seconds, then processes them one at a time (only one image in memory at a time) and sends a single combined reply.
+
+To change the OCR model, set `NVIDIA_VISION_MODEL` in your environment. The API call is retried up to 2 times on transient errors (rate limits, timeouts, 5xx responses).
 
 ---
 
@@ -339,13 +425,19 @@ You can use `/web off` to disable this entirely, `/web searxng` to use your self
 - Run `/validate` to test which models work
 - Run `/clearvalidation` then `/validate` to start fresh
 
+### Image OCR not working
+- Ensure `NVIDIA_API_KEY` is set — OCR requires it regardless of your active chat provider
+- Check that `NVIDIA_VISION_MODEL` is a vision-capable model (default `google/gemma-3-27b-it` supports vision)
+- If you get empty responses, try a different model via `NVIDIA_VISION_MODEL=meta/llama-3.2-11b-vision-instruct`
+- For rate limit errors the bot retries automatically (up to 2 retries with backoff)
+
 ---
 
 ## 🛠️ Project Structure
 
 ```
 chat-telegram/
-├── bot.py                  # Main bot (1862 lines — all features)
+├── bot.py                  # Main bot — all features including image OCR
 ├── requirements.txt        # Python dependencies
 ├── Dockerfile              # Docker build config
 ├── .env.example            # Example environment file
