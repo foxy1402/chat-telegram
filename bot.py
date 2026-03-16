@@ -65,6 +65,8 @@ NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY')
 # Vision / OCR Configuration
 NVIDIA_VISION_MODEL = os.getenv('OCR_VISION_MODEL', 'google/gemma-3-27b-it')
 VISION_BASE_URL     = os.getenv('VISION_BASE_URL', 'https://integrate.api.nvidia.com/v1').rstrip('/')
+# OCR_API_KEY takes priority; falls back to NVIDIA_API_KEY so existing setups need no change
+OCR_API_KEY         = os.getenv('OCR_API_KEY') or NVIDIA_API_KEY
 try:
     MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', str(15 * 1024 * 1024)))  # 15 MB
 except ValueError:
@@ -1683,7 +1685,7 @@ _media_group_tasks:  Dict[str, "asyncio.Task[None]"] = {}
 def _nvidia_vision_sync(b64_data: str, prompt: str) -> str:
     """Blocking NVIDIA vision call. Runs inside asyncio.to_thread — never call directly."""
     headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Authorization": f"Bearer {OCR_API_KEY}",
         "Accept": "text/event-stream",
     }
     payload = {
@@ -1875,9 +1877,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
 
-    if not NVIDIA_API_KEY:
+    if not OCR_API_KEY:
         await update.message.reply_text(
-            "❌ Image OCR requires `NVIDIA_API_KEY` to be configured.",
+            "❌ Image OCR requires `NVIDIA_API_KEY` or `OCR_API_KEY` to be configured.",
             parse_mode='Markdown'
         )
         return
@@ -1974,10 +1976,10 @@ def main():
 
     logger.info("🚀 Multi-Provider AI Bot started!")
     logger.info(f"📡 Providers: {', '.join(provider_manager.list_providers())}")
-    if NVIDIA_API_KEY:
+    if OCR_API_KEY:
         logger.info(f"🖼️  Image OCR enabled — model: {NVIDIA_VISION_MODEL} endpoint: {VISION_BASE_URL}")
     else:
-        logger.info("🖼️  Image OCR disabled — set NVIDIA_API_KEY to enable")
+        logger.info("🖼️  Image OCR disabled — set NVIDIA_API_KEY or OCR_API_KEY to enable")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
