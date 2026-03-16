@@ -63,7 +63,8 @@ CEREBRAS_API_KEY = os.getenv('CEREBRAS_API_KEY')
 NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY')
 
 # Vision / OCR Configuration
-NVIDIA_VISION_MODEL = os.getenv('NVIDIA_VISION_MODEL', 'google/gemma-3-27b-it')
+NVIDIA_VISION_MODEL = os.getenv('OCR_VISION_MODEL', 'google/gemma-3-27b-it')
+VISION_BASE_URL     = os.getenv('VISION_BASE_URL', 'https://integrate.api.nvidia.com/v1').rstrip('/')
 try:
     MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', str(15 * 1024 * 1024)))  # 15 MB
 except ValueError:
@@ -1663,7 +1664,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   in memory at a time even for large albums.
 # ============================================================================
 
-_NVIDIA_VISION_URL  = "https://integrate.api.nvidia.com/v1/chat/completions"
+_NVIDIA_VISION_URL  = f"{VISION_BASE_URL}/chat/completions"
 _MEDIA_GROUP_WAIT   = 1.5   # seconds to collect all photos in an album
 _OCR_MAX_RETRIES    = 2     # retry the NVIDIA API call up to 2 extra times
 _OCR_RETRY_BASE_DELAY = 3.0 # seconds; doubles each attempt (3s, 6s)
@@ -1974,7 +1975,7 @@ def main():
     logger.info("🚀 Multi-Provider AI Bot started!")
     logger.info(f"📡 Providers: {', '.join(provider_manager.list_providers())}")
     if NVIDIA_API_KEY:
-        logger.info(f"🖼️  Image OCR enabled — model: {NVIDIA_VISION_MODEL}")
+        logger.info(f"🖼️  Image OCR enabled — model: {NVIDIA_VISION_MODEL} endpoint: {VISION_BASE_URL}")
     else:
         logger.info("🖼️  Image OCR disabled — set NVIDIA_API_KEY to enable")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

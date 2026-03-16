@@ -144,14 +144,20 @@ MAX_HISTORY_MESSAGES=20
 
 ### Image OCR
 
-OCR requires `NVIDIA_API_KEY`. All image processing is done fully in-memory — no files are written to disk.
+OCR requires `NVIDIA_API_KEY`. All processing is fully in-memory — no files are written to disk.
+All three vars below are **optional** — defaults work out of the box with just `NVIDIA_API_KEY`.
 
 ```env
-# Vision model used for image OCR (default: google/gemma-3-27b-it)
-# Other good options: meta/llama-3.2-11b-vision-instruct
-#                     meta/llama-3.2-90b-vision-instruct
-#                     microsoft/phi-3.5-vision-instruct
-NVIDIA_VISION_MODEL=google/gemma-3-27b-it
+# Vision model used for OCR (default: google/gemma-3-27b-it)
+# Other options: meta/llama-3.2-11b-vision-instruct
+#                meta/llama-3.2-90b-vision-instruct
+#                microsoft/phi-3.5-vision-instruct
+OCR_VISION_MODEL=google/gemma-3-27b-it
+
+# Base URL of the vision API endpoint (default: NVIDIA NIM)
+# Override to point at any OpenAI-compatible vision endpoint
+# /chat/completions is appended automatically
+VISION_BASE_URL=https://integrate.api.nvidia.com/v1
 
 # Maximum image size accepted (default: 15728640 = 15 MB)
 MAX_IMAGE_BYTES=15728640
@@ -230,7 +236,7 @@ Just send a photo — no commands needed.
 - Requires `NVIDIA_API_KEY` to be set
 - The OCR result is stored in conversation history as plain text, so you can ask follow-up questions about the content without re-uploading the image
 - Failed photos in a multi-photo upload are reported inline; remaining photos still process
-- The vision model can be changed via the `NVIDIA_VISION_MODEL` env var
+- Fully customizable via env vars: `OCR_VISION_MODEL`, `VISION_BASE_URL`, `MAX_IMAGE_BYTES`
 
 ### Thinking Mode 💭 (NVIDIA Only)
 
@@ -382,7 +388,15 @@ Bot: ✅ Verified Models for NVIDIA:
 
 For **multi-photo uploads** (albums): Telegram sends each photo as a separate event. The bot collects them for 1.5 seconds, then processes them one at a time (only one image in memory at a time) and sends a single combined reply.
 
-To change the OCR model, set `NVIDIA_VISION_MODEL` in your environment. The API call is retried up to 2 times on transient errors (rate limits, timeouts, 5xx responses).
+The OCR pipeline is fully customizable via three env vars — all optional, all defaulting to NVIDIA's free tier:
+
+| Env Var | Default | Purpose |
+|---------|---------|---------|
+| `OCR_VISION_MODEL` | `google/gemma-3-27b-it` | Vision model used for OCR |
+| `VISION_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Any OpenAI-compatible vision endpoint |
+| `MAX_IMAGE_BYTES` | `15728640` (15 MB) | Max accepted image size |
+
+The API call is retried up to 2 times on transient errors (rate limits, timeouts, 5xx responses).
 
 ---
 
@@ -427,8 +441,9 @@ You can use `/web off` to disable this entirely, `/web searxng` to use your self
 
 ### Image OCR not working
 - Ensure `NVIDIA_API_KEY` is set — OCR requires it regardless of your active chat provider
-- Check that `NVIDIA_VISION_MODEL` is a vision-capable model (default `google/gemma-3-27b-it` supports vision)
-- If you get empty responses, try a different model via `NVIDIA_VISION_MODEL=meta/llama-3.2-11b-vision-instruct`
+- Check that `OCR_VISION_MODEL` is a vision-capable model (default `google/gemma-3-27b-it` supports vision)
+- If you get empty responses, try a different model: `OCR_VISION_MODEL=meta/llama-3.2-11b-vision-instruct`
+- To use a custom endpoint: `VISION_BASE_URL=https://your-host/v1` (any OpenAI-compatible vision API)
 - For rate limit errors the bot retries automatically (up to 2 retries with backoff)
 
 ---
