@@ -749,12 +749,6 @@ class NvidiaProvider(AIProvider):
                 stream=False,
             )
             content = response.choices[0].message.content if response.choices else None
-            # #region agent log
-            logger.info(
-                "[DBG ab8c77] NVIDIA non-stream | hyp=E-revert | content_is_none=%s | content_len=%s",
-                content is None, len(content) if content else 0
-            )
-            # #endregion
             if not content:
                 raise ValueError("API returned empty response.")
             return content
