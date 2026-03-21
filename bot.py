@@ -104,8 +104,11 @@ _PROMPT_SEARCH_DECISION = (
     "You are a search router. Decide if the user's latest message needs a "
     "live web search to answer accurately. Today's date is {date}.\n\n"
     "Respond with EXACTLY one line:\n"
-    "  SEARCH: <2-6 word query>   — needs current/real-time info\n"
-    "  NOSEARCH                   — can answer from training knowledge\n\n"
+    "  SEARCH: <query>   — needs current/real-time info\n"
+    "  NOSEARCH           — can answer from training knowledge\n\n"
+    "Query rules: be specific. Include the exact subject noun (product name, person, topic). "
+    "For time-sensitive questions add the current year. Aim for 4-8 words. "
+    "Never truncate mid-phrase — the query must be self-contained and searchable.\n\n"
     "Use SEARCH for: current events, live prices, weather, sports scores, "
     "recent news, product availability, real-time data, people's current status, "
     "or any fact you are NOT fully confident about.\n\n"
@@ -119,8 +122,11 @@ _PROMPT_SEARCH_DECISION = (
 _PROMPT_SEARCH_RESULTS = (
     "\n\nSEARCH RESULTS FORMAT:\n"
     "When web search results are provided, they appear as numbered snippets "
-    "(1. Title: text). Use them to answer accurately. "
-    "You may refer to a result naturally (e.g. 'according to X') but do NOT "
+    "(1. Title: text). Base your answer ONLY on information contained in these snippets. "
+    "Do NOT use your training data to fill in facts that are absent from the snippets — "
+    "if the snippets do not contain enough information to answer confidently, "
+    "say so clearly (e.g. 'The search results don't specify this — please check a dedicated source'). "
+    "You may refer to a result naturally (e.g. 'according to Tom's Hardware') but do NOT "
     "write citation numbers like [1] or [2] — there is no reference list."
 )
 
@@ -264,7 +270,11 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
                 max_tokens=100,
             ) or ""
             if response.strip():
-                return _parse_search_query(response)
+                # #region agent log
+                parsed = _parse_search_query(response)
+                logger.info("[DBG ab8c77] raw=%r parsed=%r", response[:200], parsed)
+                return parsed
+                # #endregion
             logger.warning(f"[Bot] Search decision attempt {attempt}: empty response, retrying...")
         except Exception as e:
             last_error = e
