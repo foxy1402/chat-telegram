@@ -9,7 +9,6 @@ import json
 import asyncio
 import datetime
 import urllib.parse
-import html as html_module
 import requests
 from abc import ABC, abstractmethod
 from typing import List, Dict, Optional, Tuple
@@ -45,11 +44,11 @@ MAX_INPUT_LENGTH   = 4000  # Reject user messages above this to protect memory a
 # Web Search Configuration
 BRAVE_API_KEY  = os.getenv('BRAVE_API_KEY', '')
 SEARXNG_URL    = os.getenv('SEARXNG_URL', '').rstrip('/')   # e.g. http://searxng.example.com
-SEARCH_ENGINE  = os.getenv('SEARCH_ENGINE', 'brave').lower()
+SEARCH_ENGINE  = os.getenv('SEARCH_ENGINE', 'duckduckgo').lower()
 try:
-    MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '3'))
+    MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '5'))
 except ValueError:
-    MAX_SEARCH_RESULTS = 3
+    MAX_SEARCH_RESULTS = 5
 try:
     MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '300'))
 except ValueError:
@@ -985,16 +984,8 @@ def clear_validated_models(provider_name: Optional[str] = None):
 
 
 # ============================================================================
-# WEB SEARCH — Brave API + DuckDuckGo HTML scraping
+# WEB SEARCH — Brave API + ddgs (multi-backend) + SearXNG
 # ============================================================================
-
-def _strip_tags(html_str: str) -> str:
-    out, in_tag = [], False
-    for c in html_str:
-        if c == '<':   in_tag = True
-        elif c == '>': in_tag = False
-        elif not in_tag: out.append(c)
-    return html_module.unescape(''.join(out)).strip()
 
 def _brave_search_sync(query: str) -> list:
     if not BRAVE_API_KEY:
@@ -1019,34 +1010,15 @@ def _brave_search_sync(query: str) -> list:
         return []
 
 def _duckduckgo_search_sync(query: str) -> list:
-    q = urllib.parse.quote_plus(query)
     try:
-        r = requests.get(f"https://html.duckduckgo.com/html/?q={q}",
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        r.raise_for_status()
-        html_text = r.text
-        snippets, pos = [], 0
-        while len(snippets) < MAX_SEARCH_RESULTS:
-            pos = html_text.find('class="result__a"', pos)
-            if pos == -1: break
-            tag_end = html_text.find('>', pos)
-            if tag_end == -1: break
-            title_end = html_text.find('</a>', tag_end + 1)
-            if title_end == -1: break
-            title = _strip_tags(html_text[tag_end + 1:title_end])
-            snip_pos    = html_text.find('class="result__snippet', pos)
-            next_result = html_text.find('class="result__a"', title_end + 1)
-            desc = ""
-            if snip_pos != -1 and (next_result == -1 or snip_pos < next_result):
-                se = html_text.find('>', snip_pos)
-                if se != -1:
-                    end = html_text.find('</a>', se + 1)
-                    if end == -1: end = html_text.find('</td>', se + 1)
-                    if end != -1:
-                        desc = _strip_tags(html_text[se + 1:end])[:MAX_SNIPPET_LEN]
-            if title and len(desc.strip()) >= 15:
-                snippets.append(f"{title}: {desc}")
-            pos = title_end + 1
+        from ddgs import DDGS
+        results = DDGS().text(query, max_results=MAX_SEARCH_RESULTS, backend="auto")
+        snippets = []
+        for r in results:
+            title = r.get("title", "").strip()
+            body  = r.get("body", "").strip()[:MAX_SNIPPET_LEN]
+            if title and len(body) >= 15:
+                snippets.append(f"{title}: {body}")
         logger.info(f"[Search] DDG '{query}' -> {len(snippets)} results")
         return snippets
     except Exception as e:

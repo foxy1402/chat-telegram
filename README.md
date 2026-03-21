@@ -178,12 +178,12 @@ BRAVE_API_KEY=your_brave_api_key
 # Leave empty if not using SearXNG
 SEARXNG_URL=http://your-searxng-host
 
-# Engine: "brave", "searxng", or "duckduckgo" (default: brave)
+# Engine: "brave", "searxng", or "duckduckgo" (default: duckduckgo)
 # Falls back to DuckDuckGo if the selected engine returns no results
-SEARCH_ENGINE=brave
+SEARCH_ENGINE=duckduckgo
 
-# Number of results to fetch (default: 3)
-MAX_SEARCH_RESULTS=3
+# Number of results to fetch (default: 5)
+MAX_SEARCH_RESULTS=5
 
 # Max snippet length per result (default: 300)
 MAX_SNIPPET_LEN=300
