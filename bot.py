@@ -44,7 +44,7 @@ MAX_INPUT_LENGTH   = 4000  # Reject user messages above this to protect memory a
 # Web Search Configuration
 BRAVE_API_KEY  = os.getenv('BRAVE_API_KEY', '')
 SEARXNG_URL    = os.getenv('SEARXNG_URL', '').rstrip('/')   # e.g. http://searxng.example.com
-SEARCH_ENGINE  = os.getenv('SEARCH_ENGINE', 'duckduckgo').lower()
+SEARCH_ENGINE  = os.getenv('SEARCH_ENGINE', 'brave').lower()
 try:
     MAX_SEARCH_RESULTS = int(os.getenv('MAX_SEARCH_RESULTS', '5'))
 except ValueError:
@@ -270,11 +270,7 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
                 max_tokens=100,
             ) or ""
             if response.strip():
-                # #region agent log
-                parsed = _parse_search_query(response)
-                logger.info("[DBG ab8c77] raw=%r parsed=%r", response[:200], parsed)
-                return parsed
-                # #endregion
+                return _parse_search_query(response)
             logger.warning(f"[Bot] Search decision attempt {attempt}: empty response, retrying...")
         except Exception as e:
             last_error = e
@@ -1037,10 +1033,6 @@ def _duckduckgo_search_sync(query: str) -> list:
             if title and len(body) >= 15:
                 snippets.append(f"{title}: {body}")
         logger.info(f"[Search] DDG '{query}' -> {len(snippets)} results")
-        # #region agent log
-        for _i, _s in enumerate(snippets):
-            logger.info("[DBG ab8c77] DDG snippet[%d]: %s", _i, _s[:200])
-        # #endregion
         return snippets
     except Exception as e:
         logger.error(f"[Search] DDG error: {e}")

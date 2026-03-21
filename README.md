@@ -171,16 +171,16 @@ MAX_IMAGE_BYTES=15728640
 
 ```env
 # Brave Search API key (free: https://brave.com/search/api/)
-# If not set, DuckDuckGo is used (free, no key needed)
+# If not set, Brave is used as default (falls back to DuckDuckGo if BRAVE_API_KEY is missing)
 BRAVE_API_KEY=your_brave_api_key
 
 # SearXNG self-hosted instance URL (no API key needed)
 # Leave empty if not using SearXNG
 SEARXNG_URL=http://your-searxng-host
 
-# Engine: "brave", "searxng", or "duckduckgo" (default: duckduckgo)
-# Falls back to DuckDuckGo if the selected engine returns no results
-SEARCH_ENGINE=duckduckgo
+# Engine: "brave", "searxng", or "duckduckgo" (default: brave)
+# Falls back to DuckDuckGo if BRAVE_API_KEY is not set
+SEARCH_ENGINE=brave
 
 # Number of results to fetch (default: 5)
 MAX_SEARCH_RESULTS=5
@@ -415,7 +415,7 @@ The API call is retried up to 2 times on transient errors (rate limits, timeouts
 4. **Bot sends your question + snippets to AI** — in one answer pass
 5. **AI returns an up-to-date response** — grounded in the fetched snippets
 
-You can use `/web off` to disable this entirely, `/web searxng` to use your self-hosted SearXNG instance, or `/web ddg` to use the free DuckDuckGo engine without any API key.
+You can use `/web off` to disable this entirely, `/web searxng` to use your self-hosted SearXNG instance, or `/web ddg` to use the free DuckDuckGo engine without any API key. Brave is the default engine for best result quality.
 
 ---
 
