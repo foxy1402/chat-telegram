@@ -660,7 +660,7 @@ class CerebrasProvider(AIProvider):
         super().__init__()
         from cerebras.cloud.sdk import Cerebras
         self.client = Cerebras(api_key=api_key)
-        self.default_model = "gpt-oss-120b"
+        self.default_model = "llama3.1-8b"
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
              enable_thinking: bool = False, max_tokens: Optional[int] = None) -> str:
