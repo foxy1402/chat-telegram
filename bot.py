@@ -743,51 +743,21 @@ class NvidiaProvider(AIProvider):
                 full = "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n"
             return full + "".join(content_parts)
         else:
-            # Always stream — NVIDIA's non-streaming path returns content=None
-            # for certain models (including gpt-oss-120b) on some responses.
-            # Streaming accumulates delta.content chunks and never yields None.
-            extra_body = (
-                {"chat_template_kwargs": {"thinking": False}}
-                if self.supports_thinking(model) else {}
-            )
             response = self.client.chat.completions.create(
                 messages=chat_messages, model=model,
                 temperature=TEMPERATURE, max_tokens=max_tokens or MAX_TOKENS,
-                **({"extra_body": extra_body} if extra_body else {}),
-                stream=True,
+                stream=False,
             )
-            content_parts = []
-            chunk_count = 0
-            # #region agent log
-            import traceback as _tb
-            # #endregion
-            try:
-                for chunk in response:
-                    chunk_count += 1
-                    if not getattr(chunk, "choices", None) or len(chunk.choices) == 0:
-                        continue
-                    delta = chunk.choices[0].delta
-                    if getattr(delta, "content", None) is not None:
-                        content_parts.append(delta.content)
-            except Exception as _stream_err:
-                # #region agent log
-                logger.error(
-                    "[DBG ab8c77] NVIDIA stream error | hyp=A-D | chunks_before_error=%d | exc_type=%s | exc_module=%s | msg=%s | tb=%s",
-                    chunk_count, type(_stream_err).__name__, type(_stream_err).__module__,
-                    str(_stream_err), _tb.format_exc()[-600:].replace("\n", "↵")
-                )
-                # #endregion
-                raise
+            content = response.choices[0].message.content if response.choices else None
             # #region agent log
             logger.info(
-                "[DBG ab8c77] NVIDIA stream OK | hyp=E | chunks=%d | content_len=%d",
-                chunk_count, len("".join(content_parts))
+                "[DBG ab8c77] NVIDIA non-stream | hyp=E-revert | content_is_none=%s | content_len=%s",
+                content is None, len(content) if content else 0
             )
             # #endregion
-            result = "".join(content_parts)
-            if not result:
+            if not content:
                 raise ValueError("API returned empty response.")
-            return result
+            return content
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
