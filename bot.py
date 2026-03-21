@@ -206,6 +206,10 @@ def _parse_search_query(response: str) -> Optional[str]:
         if len(raw) > 2 and raw[0] == q and raw[-1] == q:
             raw = raw[1:-1].strip()
 
+    # Normalize Unicode hyphens/dashes to ASCII hyphen so the regex below
+    # doesn't stop at typographic chars that models (e.g. gpt-oss-120b) emit.
+    raw = raw.replace('\u2011', '-').replace('\u2013', '-').replace('\u2014', '-')
+
     # Keep only the leading valid-query portion.
     # Valid chars: letters, digits, spaces, - ' " . / & + % @ # ( )
     # First char outside this set is treated as end-of-query.
