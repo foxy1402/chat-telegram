@@ -757,12 +757,33 @@ class NvidiaProvider(AIProvider):
                 stream=True,
             )
             content_parts = []
-            for chunk in response:
-                if not getattr(chunk, "choices", None) or len(chunk.choices) == 0:
-                    continue
-                delta = chunk.choices[0].delta
-                if getattr(delta, "content", None) is not None:
-                    content_parts.append(delta.content)
+            chunk_count = 0
+            # #region agent log
+            import traceback as _tb
+            # #endregion
+            try:
+                for chunk in response:
+                    chunk_count += 1
+                    if not getattr(chunk, "choices", None) or len(chunk.choices) == 0:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if getattr(delta, "content", None) is not None:
+                        content_parts.append(delta.content)
+            except Exception as _stream_err:
+                # #region agent log
+                logger.error(
+                    "[DBG ab8c77] NVIDIA stream error | hyp=A-D | chunks_before_error=%d | exc_type=%s | exc_module=%s | msg=%s | tb=%s",
+                    chunk_count, type(_stream_err).__name__, type(_stream_err).__module__,
+                    str(_stream_err), _tb.format_exc()[-600:].replace("\n", "↵")
+                )
+                # #endregion
+                raise
+            # #region agent log
+            logger.info(
+                "[DBG ab8c77] NVIDIA stream OK | hyp=E | chunks=%d | content_len=%d",
+                chunk_count, len("".join(content_parts))
+            )
+            # #endregion
             result = "".join(content_parts)
             if not result:
                 raise ValueError("API returned empty response.")
