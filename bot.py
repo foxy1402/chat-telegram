@@ -260,7 +260,11 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
                 max_tokens=100,
             ) or ""
             if response.strip():
-                return _parse_search_query(response)
+                # #region agent log
+                parsed = _parse_search_query(response)
+                logger.info("[DBG ab8c77] raw_response=%r | parsed=%r | hyp=A-E", response[:300], parsed)
+                return parsed
+                # #endregion
             logger.warning(f"[Bot] Search decision attempt {attempt}: empty response, retrying...")
         except Exception as e:
             last_error = e
