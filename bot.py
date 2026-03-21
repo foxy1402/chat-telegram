@@ -257,6 +257,7 @@ async def ai_decide_search(provider, model: Optional[str], messages: list) -> Op
                 messages=decision_msgs,
                 model=model,
                 enable_thinking=False,
+                max_tokens=100,
             ) or ""
             if response.strip():
                 return _parse_search_query(response)
@@ -419,7 +420,7 @@ class AIProvider(ABC):
 
     @abstractmethod
     def chat(self, messages: List[Dict], model: Optional[str] = None,
-             enable_thinking: bool = False) -> str:
+             enable_thinking: bool = False, max_tokens: Optional[int] = None) -> str:
         pass
 
     @abstractmethod
@@ -464,14 +465,14 @@ class GroqProvider(AIProvider):
         self.default_model = 'llama-3.3-70b-versatile'
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
-             enable_thinking: bool = False) -> str:
+             enable_thinking: bool = False, max_tokens: Optional[int] = None) -> str:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get('role') == 'system' for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         response = self.client.chat.completions.create(
             messages=chat_messages, model=model,
-            temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE, max_tokens=max_tokens or MAX_TOKENS,
         )
         if not response.choices or response.choices[0].message.content is None:
             raise ValueError("API returned empty response.")
@@ -518,14 +519,14 @@ class GeminiProvider(AIProvider):
         self.default_model = "gemini-1.5-flash"
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
-             enable_thinking: bool = False) -> str:
+             enable_thinking: bool = False, max_tokens: Optional[int] = None) -> str:
         if not messages:
             raise ValueError("Messages list cannot be empty")
         model_name = model or self.default_model
         system_msg = next((m["content"] for m in messages if m["role"] == "system"), SYSTEM_PROMPT)
         gen_model = self.genai.GenerativeModel(
             model_name,
-            generation_config={"temperature": TEMPERATURE, "max_output_tokens": MAX_TOKENS},
+            generation_config={"temperature": TEMPERATURE, "max_output_tokens": max_tokens or MAX_TOKENS},
             system_instruction=system_msg
         )
         chat_history = []
@@ -581,14 +582,14 @@ class OpenRouterProvider(AIProvider):
         self.default_model = "openrouter/free"
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
-             enable_thinking: bool = False) -> str:
+             enable_thinking: bool = False, max_tokens: Optional[int] = None) -> str:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get('role') == 'system' for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         response = self.client.chat.completions.create(
             model=model, messages=chat_messages,
-            temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE, max_tokens=max_tokens or MAX_TOKENS,
         )
         if not response.choices or response.choices[0].message.content is None:
             raise ValueError("API returned empty response.")
@@ -652,14 +653,14 @@ class CerebrasProvider(AIProvider):
         self.default_model = "gpt-oss-120b"
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
-             enable_thinking: bool = False) -> str:
+             enable_thinking: bool = False, max_tokens: Optional[int] = None) -> str:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get('role') == 'system' for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         response = self.client.chat.completions.create(
             messages=chat_messages, model=model,
-            temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE, max_tokens=max_tokens or MAX_TOKENS,
         )
         if not response.choices or response.choices[0].message.content is None:
             raise ValueError("API returned empty response.")
@@ -715,7 +716,7 @@ class NvidiaProvider(AIProvider):
         return model_id not in self.MODELS_WITHOUT_THINKING
 
     def chat(self, messages: List[Dict], model: Optional[str] = None,
-             enable_thinking: bool = False) -> str:
+             enable_thinking: bool = False, max_tokens: Optional[int] = None) -> str:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get('role') == 'system' for msg in chat_messages):
@@ -724,7 +725,7 @@ class NvidiaProvider(AIProvider):
         if enable_thinking and self.supports_thinking(model):
             response = self.client.chat.completions.create(
                 messages=chat_messages, model=model,
-                temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE, max_tokens=max_tokens or MAX_TOKENS,
                 extra_body={"chat_template_kwargs": {"thinking": True}},
                 stream=True
             )
@@ -742,13 +743,30 @@ class NvidiaProvider(AIProvider):
                 full = "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n"
             return full + "".join(content_parts)
         else:
+            # Always stream — NVIDIA's non-streaming path returns content=None
+            # for certain models (including gpt-oss-120b) on some responses.
+            # Streaming accumulates delta.content chunks and never yields None.
+            extra_body = (
+                {"chat_template_kwargs": {"thinking": False}}
+                if self.supports_thinking(model) else {}
+            )
             response = self.client.chat.completions.create(
                 messages=chat_messages, model=model,
-                temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE, max_tokens=max_tokens or MAX_TOKENS,
+                **({"extra_body": extra_body} if extra_body else {}),
+                stream=True,
             )
-            if not response.choices or response.choices[0].message.content is None:
+            content_parts = []
+            for chunk in response:
+                if not getattr(chunk, "choices", None) or len(chunk.choices) == 0:
+                    continue
+                delta = chunk.choices[0].delta
+                if getattr(delta, "content", None) is not None:
+                    content_parts.append(delta.content)
+            result = "".join(content_parts)
+            if not result:
                 raise ValueError("API returned empty response.")
-            return response.choices[0].message.content
+            return result
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
