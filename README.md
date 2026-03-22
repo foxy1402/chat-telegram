@@ -174,8 +174,10 @@ MAX_IMAGE_BYTES=15728640
 # If not set, Brave is used as default (falls back to DuckDuckGo if BRAVE_API_KEY is missing)
 BRAVE_API_KEY=your_brave_api_key
 
-# SearXNG self-hosted instance URL (no API key needed)
+# SearXNG instance URL (no API key needed)
 # Leave empty if not using SearXNG
+# Free public instance provided by LiteLLM:
+#   SEARXNG_URL=https://serxng-deployment-production.up.railway.app
 SEARXNG_URL=http://your-searxng-host
 
 # Engine: "brave", "searxng", or "duckduckgo" (default: brave)
@@ -438,7 +440,7 @@ You can use `/web off` to disable this entirely, `/web searxng` to use your self
 ### Web search not working
 - Check if web search is enabled: `/web`
 - For Brave: ensure `BRAVE_API_KEY` is set
-- For SearXNG: ensure `SEARXNG_URL` is set and the instance has JSON format enabled
+- For SearXNG: ensure `SEARXNG_URL` is set and the instance has JSON format enabled. A free public instance is available at `https://serxng-deployment-production.up.railway.app` (provided by LiteLLM)
 - Try DuckDuckGo (no key needed): `/web ddg`
 
 ### Models not loading
