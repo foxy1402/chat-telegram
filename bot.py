@@ -243,7 +243,7 @@ def _build_search_context(query: str, snippets: list) -> str:
 
 
 _SEARCH_DECISION_RETRIES = 3
-_SEARCH_DECISION_RETRY_DELAY = 1.0  # seconds between retries
+_SEARCH_DECISION_RETRY_DELAY = 2.0  # seconds between retries
 
 async def ai_decide_search(provider, model: Optional[str], messages: list) -> Optional[str]:
     """Lightweight AI call to decide SEARCH vs NOSEARCH.
