@@ -50,7 +50,7 @@ try:
 except ValueError:
     MAX_SEARCH_RESULTS = 5
 try:
-    MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '300'))
+    MAX_SNIPPET_LEN = int(os.getenv('MAX_SNIPPET_LEN', '500'))
 except ValueError:
     MAX_SNIPPET_LEN = 300
 
