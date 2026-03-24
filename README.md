@@ -1,6 +1,6 @@
 # 🤖 Multi-Provider AI Telegram Bot
 
-> **A universal free AI model hub for Telegram** — Switch between Groq, Gemini, OpenRouter, Cerebras, and NVIDIA with simple commands. Built-in web search, model validation, and thinking mode!
+> **A universal free AI model hub for Telegram** — Switch between Groq, Gemini, OpenRouter, Cerebras, NVIDIA, and any custom OpenAI-compatible endpoint with simple commands. Built-in web search, model validation, and thinking mode!
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-foxy1402%2Fchat--telegram-blue?logo=github)](https://github.com/foxy1402/chat-telegram/pkgs/container/chat-telegram)
 
@@ -8,7 +8,7 @@
 
 ## ✨ Features
 
-- 🔄 **5 AI Providers** — Groq, Gemini, OpenRouter, Cerebras, NVIDIA
+- 🔄 **6 AI Providers** — Groq, Gemini, OpenRouter, Cerebras, NVIDIA, and any Custom OpenAI-compatible endpoint
 - 🖼️ **Image OCR** — Send any photo and the bot extracts text or describes content via NVIDIA vision models
 - 🌐 **Web Search** — AI can search the web for real-time info (Brave API, SearXNG, or DuckDuckGo)
 - 💭 **Thinking Mode** — See AI reasoning traces with NVIDIA models
@@ -34,6 +34,7 @@ You need at least **one** provider key (all are free):
 | **OpenRouter** | [openrouter.ai](https://openrouter.ai) | 50–1,000 requests/day |
 | **Cerebras** | [cerebras.ai](https://cerebras.ai) | Free tier, fast inference |
 | **NVIDIA** | [build.nvidia.com](https://build.nvidia.com) | Free tier, thinking models 💭 |
+| **Custom** | Any OpenAI-compatible endpoint | Depends on provider |
 
 ### 2. Get Telegram Bot Token
 
@@ -119,6 +120,26 @@ CEREBRAS_API_KEY=your_cerebras_api_key
 NVIDIA_API_KEY=your_nvidia_api_key
 ```
 
+### Custom Provider (OpenAI-compatible endpoint)
+
+Point the bot at **any OpenAI-compatible API** — Ollama, LiteLLM, vLLM, Together AI, self-hosted, etc.
+All three variables must be set together; if any is missing the provider is skipped.
+
+```env
+# Base URL of your OpenAI-compatible endpoint (e.g. http://localhost:11434/v1)
+CUSTOM_BASE_URL=https://your-endpoint.com/v1
+
+# API key for the endpoint (use any non-empty string for keyless endpoints like Ollama)
+CUSTOM_API_KEY=your_custom_api_key
+
+# Default model ID to use when no model is explicitly selected
+CUSTOM_DEFAULT_MODEL=your-model-id
+```
+
+> **Tip:** The bot will automatically try to discover all available models via `GET /models`.
+> If the endpoint doesn't expose that route it silently falls back to `CUSTOM_DEFAULT_MODEL` only.
+> Use `/provider custom` to switch to it and `/models all` to see discovered models.
+
 ### Access Control
 
 ```env
@@ -200,7 +221,7 @@ MAX_SNIPPET_LEN=300
 | Command | Description |
 |---------|-------------|
 | `/provider` | Show current provider and available options |
-| `/provider <name>` | Switch provider (`groq`, `gemini`, `openrouter`, `cerebras`, `nvidia`) |
+| `/provider <name>` | Switch provider (`groq`, `gemini`, `openrouter`, `cerebras`, `nvidia`, `custom`) |
 | `/models` | List verified working models for current provider |
 | `/models all` | List all available models from API |
 | `/model <id>` | Switch to a specific model |
@@ -379,6 +400,7 @@ Bot: ✅ Verified Models for NVIDIA:
 | **NVIDIA** | Free tier | Thinking + vision | ⚡⚡⚡⚡ | 💭 Reasoning mode, 🖼️ Image OCR |
 | **Gemini** | 100–1,000 | Quality responses | ⚡⚡⚡ | — |
 | **OpenRouter** | 50–1,000 | Model variety | ⚡⚡ | — |
+| **Custom** | Depends on provider | Self-hosted / private models | Varies | Any OpenAI-compatible endpoint |
 
 ---
 
@@ -422,6 +444,13 @@ You can use `/web off` to disable this entirely, `/web searxng` to use your self
 ---
 
 ## 🔧 Troubleshooting
+
+### Custom provider not appearing
+- All three env vars must be set: `CUSTOM_API_KEY`, `CUSTOM_BASE_URL`, `CUSTOM_DEFAULT_MODEL`
+- Make sure `CUSTOM_BASE_URL` ends with `/v1` (or whatever path prefix your endpoint uses) — the bot strips a trailing `/` automatically
+- For keyless endpoints (e.g. local Ollama), set `CUSTOM_API_KEY` to any non-empty string like `ollama`
+- Check logs at startup — a successful init prints `✅ Custom provider initialized`
+- Use `/provider custom` to switch to it, then `/models all` to list discovered models
 
 ### Bot doesn't respond
 1. Check logs: `docker logs -f multi-ai-bot`
@@ -491,6 +520,7 @@ Built with:
 - [Cerebras](https://cerebras.ai/)
 - [NVIDIA](https://build.nvidia.com/)
 - [Brave Search](https://brave.com/search/api/)
+- [OpenAI Python SDK](https://github.com/openai/openai-python) — used by OpenRouter, NVIDIA, and Custom providers
 
 ---
 
