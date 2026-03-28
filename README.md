@@ -14,6 +14,7 @@
 - 💭 **Thinking Mode** — See AI reasoning traces with NVIDIA models
 - ✅ **Model Validation** — Test which models actually work before using them
 - ⚡ **Easy Switching** — Change providers and models with simple commands
+- 🛑 **Instant Cancel** — `/restart` aborts any stuck or slow AI request immediately, even mid-retry
 - 🔒 **User Whitelisting** — Restrict access to specific Telegram users
 - 💬 **Conversation History** — Context maintained across messages (including after OCR)
 - 🆓 **100% Free** — Uses only free-tier APIs (no credit card required)
@@ -281,6 +282,7 @@ Only NVIDIA models with a 💭 icon support thinking. The bot will warn you if y
 |---------|-------------|
 | `/start` | Welcome message with status overview |
 | `/clear` | Clear conversation history |
+| `/restart` | Abort any stuck or slow in-flight AI request |
 | `/help` | Full command reference |
 
 ---
@@ -389,6 +391,25 @@ Bot: ✅ Verified Models for NVIDIA:
      ...
 ```
 
+### Cancelling a Stuck Request
+
+Some LLM endpoints (especially free-tier ones with long queues) can take 5–30 minutes to respond while the bot silently retries. Use `/restart` to abort immediately:
+
+```
+You: explain the entire history of the universe in detail
+     (Bot is thinking... nothing arrives for 5 minutes)
+
+You: /restart
+Bot: 🛑 Restart requested.
+     Any pending AI request has been signalled to stop.
+     You can send a new message now.
+
+You: actually just give me a one-line summary
+Bot: The universe began ~13.8 billion years ago with the Big Bang and has been expanding ever since.
+```
+
+`/restart` works at any point — whether the bot is waiting for the first response, sleeping between retries, or doing a web search decision call.
+
 ---
 
 ## 📊 Provider Comparison
@@ -465,6 +486,12 @@ You can use `/web off` to disable this entirely, `/web searxng` to use your self
 - Switch provider: `/provider <name>`
 - Check rate limits — try again in a few minutes
 - Run `/validate` to find working models
+
+### Bot takes too long to respond / feels stuck
+- Free-tier LLM endpoints can queue for 5–30 minutes under heavy load
+- Send `/restart` at any time to immediately abort the pending request
+- The bot will confirm cancellation; you can then send a new message or switch provider with `/provider <name>`
+- To avoid this, use faster providers (Groq or Cerebras) or run `/validate` to find reliably fast models
 
 ### Web search not working
 - Check if web search is enabled: `/web`

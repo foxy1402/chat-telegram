@@ -374,39 +374,77 @@ _CHAT_MAX_RETRIES = 2
 _CHAT_RETRY_BASE_DELAY = 3.0  # seconds; doubles each attempt (3s, 6s)
 
 
+# Per-attempt timeout for LLM calls — prevents a single hung request from
+# blocking a retry indefinitely. Keep generous enough for slow endpoints.
+_CHAT_ATTEMPT_TIMEOUT = 120.0  # seconds per individual provider.chat() call
+
+
 async def _chat_with_retry(
     provider,
     messages: list,
     model: Optional[str],
     enable_thinking: bool,
+    cancel_event: Optional["asyncio.Event"] = None,
 ) -> str:
     """Call provider.chat() with automatic retry on transient errors.
 
     Retries up to _CHAT_MAX_RETRIES times with exponential backoff.
     Non-transient errors (bad model, auth failures, etc.) raise immediately.
+    Each attempt is wrapped in asyncio.wait_for(_CHAT_ATTEMPT_TIMEOUT) so a
+    totally unresponsive endpoint doesn't hold a retry slot forever.
+    If *cancel_event* is set (e.g. the user issued /restart) the call raises
+    asyncio.CancelledError immediately — even during a retry sleep.
     """
     for attempt in range(1, _CHAT_MAX_RETRIES + 2):
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError("Cancelled by /restart")
         try:
-            return (
-                await asyncio.to_thread(
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
                     provider.chat,
                     messages=messages,
                     model=model,
                     enable_thinking=enable_thinking,
-                )
-                or ""
+                ),
+                timeout=_CHAT_ATTEMPT_TIMEOUT,
             )
+            return result or ""
+        except asyncio.TimeoutError:
+            if attempt > _CHAT_MAX_RETRIES:
+                raise
+            logger.warning(
+                f"[Bot] API call timed out after {_CHAT_ATTEMPT_TIMEOUT:.0f}s "
+                f"(attempt {attempt}/{_CHAT_MAX_RETRIES + 1}) — retrying"
+            )
+            e_for_delay = asyncio.TimeoutError()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             if attempt > _CHAT_MAX_RETRIES:
                 raise
             error_lower = str(e).lower()
             if not any(kw in error_lower for kw in _TRANSIENT_ERROR_KEYWORDS):
                 raise  # Permanent error — don't retry
-            delay = _CHAT_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-            logger.warning(
-                f"[Bot] Transient API error (attempt {attempt}/{_CHAT_MAX_RETRIES + 1}): "
-                f"{e} — retrying in {delay:.0f}s"
-            )
+            e_for_delay = e
+        else:
+            break  # success path is handled by return above
+
+        delay = _CHAT_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+        logger.warning(
+            f"[Bot] Transient API error (attempt {attempt}/{_CHAT_MAX_RETRIES + 1}): "
+            f"{e_for_delay} — retrying in {delay:.0f}s"
+        )
+        # Interruptible sleep — /restart wakes us immediately
+        if cancel_event:
+            try:
+                await asyncio.wait_for(
+                    cancel_event.wait(), timeout=delay
+                )
+                # Event was set — user cancelled
+                raise asyncio.CancelledError("Cancelled by /restart")
+            except asyncio.TimeoutError:
+                pass  # Normal: delay elapsed, proceed to next attempt
+        else:
             await asyncio.sleep(delay)
     return ""  # unreachable, satisfies type checker
 
@@ -1176,6 +1214,8 @@ def get_user_session(user_id: str) -> Dict:
             "web_search": True,
             "search_engine": default_engine,
             "last_seen": now,
+            # asyncio.Event used by /restart to abort in-flight LLM calls
+            "cancel_event": asyncio.Event(),
         }
     else:
         user_sessions[user_id]["last_seen"] = now
@@ -1399,6 +1439,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/web - Toggle web search\n"
         f"/refresh - Refresh model lists\n"
         f"/clear - Clear conversation history\n"
+        f"/restart - Cancel any stuck/pending AI request\n"
         f"/help - Show help",
         parse_mode="Markdown",
     )
@@ -1464,6 +1505,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Requires `NVIDIA_API_KEY` to be set\n\n"
         "*Other:*\n"
         "• `/clear` — clear conversation history\n"
+        "• `/restart` — cancel any stuck/pending AI request\n"
         "• `/help` — this message",
         parse_mode="Markdown",
     )
@@ -1845,6 +1887,41 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
+# RESTART COMMAND — abort any in-flight LLM request for this user
+# ============================================================================
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel an in-flight AI request that is taking too long.
+
+    Sets the user's cancel_event so that:
+    - handle_message exits at the next cancellation checkpoint
+    - _chat_with_retry aborts its current asyncio.to_thread call or wakes
+      early from a retry-backoff sleep
+    The event is automatically cleared at the start of the next message.
+    """
+    user_id = str(update.effective_user.id)
+    if not is_user_allowed(user_id):
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
+        return
+    session = get_user_session(user_id)
+    cancel_event: asyncio.Event = session["cancel_event"]
+    cancel_event.set()  # signal any in-flight call to abort
+    # Roll back any dangling user message added to history before the abort
+    history = session["history"]
+    if history and history[-1].get("role") == "user":
+        history.pop()
+    await update.message.reply_text(
+        "🛑 *Restart requested.*\n\n"
+        "Any pending AI request has been signalled to stop. "
+        "You can send a new message now.",
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================================
 # MESSAGE HANDLER — AI-routed search (v4)
 #
 # FLOW:
@@ -1886,9 +1963,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     session = get_user_session(user_id)
+    cancel_event: asyncio.Event = session["cancel_event"]
+    # Clear any previous /restart signal so this request starts fresh
+    cancel_event.clear()
     assistant_appended = False
 
     try:
+        if cancel_event.is_set():
+            return  # race: /restart arrived between clear() and here — abort silently
         try:
             await update.message.chat.send_action(action="typing")
         except Exception:
@@ -1907,6 +1989,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         search_query = None
 
         if not skip:
+            if cancel_event.is_set():
+                raise asyncio.CancelledError("Cancelled by /restart")
             logger.info(
                 f"[Bot] user={user_id} provider={provider_name} → asking AI for search decision"
             )
@@ -1944,6 +2028,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS}
                 )
 
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError("Cancelled by /restart")
                 try:
                     await update.message.chat.send_action(action="typing")
                 except Exception:
@@ -1953,6 +2039,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     messages=search_msgs,
                     model=current_model,
                     enable_thinking=thinking_enabled,
+                    cancel_event=cancel_event,
                 )
             else:
                 logger.warning(
@@ -1963,10 +2050,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     messages=session["history"],
                     model=current_model,
                     enable_thinking=thinking_enabled,
+                    cancel_event=cancel_event,
                 )
 
         # ── NO-SEARCH PATH ────────────────────────────────────────────────
         else:
+            if cancel_event.is_set():
+                raise asyncio.CancelledError("Cancelled by /restart")
             if skip:
                 logger.info(
                     f"[Bot] user={user_id} provider={provider_name} → quick-filter skip, direct AI call"
@@ -1976,6 +2066,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 messages=session["history"],
                 model=current_model,
                 enable_thinking=thinking_enabled,
+                cancel_event=cancel_event,
             )
 
         # ── Fallback for empty response ────────────────────────────────────
@@ -2016,6 +2107,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 header = f"📄 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
                 await reply_text_safe(update.message, header + chunk)
 
+    except asyncio.CancelledError:
+        # /restart was issued — clean up history silently (restart_command already
+        # sent the user-facing message and may have trimmed the last user turn).
+        logger.info(f"[Bot] user={user_id} request cancelled by /restart")
+        if (
+            assistant_appended
+            and session["history"]
+            and session["history"][-1].get("role") == "assistant"
+        ):
+            session["history"].pop()
+        if session["history"] and session["history"][-1].get("role") == "user":
+            session["history"].pop()
     except Exception as e:
         logger.error(f"Error in handle_message: {e}", exc_info=True)
         # Roll back the incomplete exchange so history stays consistent.
@@ -2383,6 +2486,7 @@ def main():
     application.add_handler(CommandHandler("clearvalidation", clearvalidation_command))
     application.add_handler(CommandHandler("thinking", thinking_command))
     application.add_handler(CommandHandler("web", web_command))
+    application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
