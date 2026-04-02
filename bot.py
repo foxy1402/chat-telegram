@@ -458,12 +458,16 @@ def _trim_history(history: list) -> list:
     """Trim history to MAX_HISTORY_MESSAGES keeping complete user/assistant pairs.
     Always removes the oldest pair (2 messages) so the model never sees a
     dangling half-exchange."""
-    while len(history) > MAX_HISTORY_MESSAGES:
-        if len(history) >= 2:
-            history.pop(0)
-            history.pop(0)
-        else:
-            history.pop(0)
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return history
+    
+    # Calculate how many pairs to remove (always remove in pairs)
+    excess = len(history) - MAX_HISTORY_MESSAGES
+    pairs_to_remove = (excess + 1) // 2  # Round up to preserve pairs
+    messages_to_remove = pairs_to_remove * 2
+    
+    # Single O(1) slice operation instead of multiple O(n) pop(0) calls
+    del history[:messages_to_remove]
     return history
 
 
@@ -1167,11 +1171,6 @@ class ProviderManager:
 provider_manager = ProviderManager()
 user_sessions: Dict[str, Dict] = {}
 
-_SESSION_TTL = 86400  # evict sessions inactive for >24 h
-_CLEANUP_INTERVAL = 3600  # run cleanup at most once per hour
-_last_session_cleanup: float = 0.0
-_cleanup_in_progress: bool = False
-
 
 # ============================================================================
 # SESSION HELPERS
@@ -1179,25 +1178,7 @@ _cleanup_in_progress: bool = False
 
 
 def get_user_session(user_id: str) -> Dict:
-    global _last_session_cleanup, _cleanup_in_progress
     now = time.time()
-
-    # Lazy hourly eviction of inactive sessions — guard prevents double-entry
-    if not _cleanup_in_progress and now - _last_session_cleanup > _CLEANUP_INTERVAL:
-        _cleanup_in_progress = True
-        try:
-            stale = [
-                uid
-                for uid, s in list(user_sessions.items())
-                if now - s.get("last_seen", 0) > _SESSION_TTL
-            ]
-            for uid in stale:
-                user_sessions.pop(uid, None)
-            if stale:
-                logger.info(f"[Session] Evicted {len(stale)} stale session(s)")
-        finally:
-            _last_session_cleanup = now
-            _cleanup_in_progress = False
 
     if user_id not in user_sessions:
         if SEARCH_ENGINE == "searxng" and SEARXNG_URL:
