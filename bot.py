@@ -932,7 +932,7 @@ class NvidiaProvider(AIProvider):
         self.client = OpenAI(
             base_url="https://integrate.api.nvidia.com/v1", api_key=api_key
         )
-        self.default_model = "openai/gpt-oss-120b"
+        self.default_model = "nvidia/nemotron-3-super-120b-a12b"
 
     def supports_thinking(self, model_id: str) -> bool:
         return model_id not in self.MODELS_WITHOUT_THINKING
@@ -1000,6 +1000,7 @@ class NvidiaProvider(AIProvider):
             {"id": "qwen/qwen3-coder-480b-a35b-instruct", "name": "Qwen3 Coder 480B"},
             {"id": "minimaxai/minimax-m2.1", "name": "MiniMax M2.1"},
             {"id": "minimaxai/minimax-m2", "name": "MiniMax M2"},
+            {"id": "nvidia/nemotron-3-super-120b-a12b", "name": "NVIDIA-Nemotron-3-Super-120B-A12B 💭"},
             {"id": "deepseek-ai/deepseek-v3.2", "name": "DeepSeek V3.2 💭"},
             {
                 "id": "deepseek-ai/deepseek-v3.1-terminus",
