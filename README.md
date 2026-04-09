@@ -26,7 +26,7 @@
 
 ### 1. Get Your API Keys
 
-You need at least **one** provider key (all are free):
+You need at least **one** provider key:
 
 | Provider | Get API Key | Free Tier |
 |----------|-------------|-----------|
@@ -35,6 +35,7 @@ You need at least **one** provider key (all are free):
 | **OpenRouter** | [openrouter.ai](https://openrouter.ai) | 50–1,000 requests/day |
 | **Cerebras** | [cerebras.ai](https://cerebras.ai) | Free tier, fast inference |
 | **NVIDIA** | [build.nvidia.com](https://build.nvidia.com) | Free tier, thinking models 💭 |
+| **Vercel** | [vercel.com](https://vercel.com) | Free tier + $5 monthly credits |
 | **Custom** | Any OpenAI-compatible endpoint | Depends on provider |
 
 ### 2. Get Telegram Bot Token
@@ -119,7 +120,17 @@ GEMINI_API_KEY=your_gemini_api_key
 OPENROUTER_API_KEY=your_openrouter_api_key
 CEREBRAS_API_KEY=your_cerebras_api_key
 NVIDIA_API_KEY=your_nvidia_api_key
+VERCEL_API_KEY=your_vercel_api_key
 ```
+
+### Vercel Provider (OpenAI-compatible, preconfigured)
+
+Set `VERCEL_API_KEY` to enable a built-in Vercel provider configured as:
+
+- Base URL: `https://ai-gateway.vercel.sh/v1`
+- Default model: `perplexity/sonar`
+
+Use `/provider vercel` to switch to it.
 
 ### Custom Provider (OpenAI-compatible endpoint)
 
@@ -151,7 +162,7 @@ ALLOWED_USER_IDS=123456789,987654321
 ### Bot Behavior
 
 ```env
-# Default provider: groq, gemini, openrouter, cerebras, or nvidia
+# Default provider: groq, gemini, openrouter, cerebras, nvidia, vercel, or custom
 DEFAULT_PROVIDER=groq
 
 # Max tokens per response (512 = concise, 1024 = balanced, 2048 = detailed)
@@ -222,7 +233,7 @@ MAX_SNIPPET_LEN=300
 | Command | Description |
 |---------|-------------|
 | `/provider` | Show current provider and available options |
-| `/provider <name>` | Switch provider (`groq`, `gemini`, `openrouter`, `cerebras`, `nvidia`, `custom`) |
+| `/provider <name>` | Switch provider (`groq`, `gemini`, `openrouter`, `cerebras`, `nvidia`, `vercel`, `custom`) |
 | `/models` | List verified working models for current provider |
 | `/models all` | List all available models from API |
 | `/model <id>` | Switch to a specific model |
@@ -419,6 +430,7 @@ Bot: The universe began ~13.8 billion years ago with the Big Bang and has been e
 | **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ | — |
 | **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ | — |
 | **NVIDIA** | Free tier | Thinking + vision | ⚡⚡⚡⚡ | 💭 Reasoning mode, 🖼️ Image OCR |
+| **Vercel** | Free tier + $5 credits/month | Perplexity Sonar via AI Gateway | ⚡⚡⚡ | Preconfigured OpenAI-compatible endpoint |
 | **Gemini** | 100–1,000 | Quality responses | ⚡⚡⚡ | — |
 | **OpenRouter** | 50–1,000 | Model variety | ⚡⚡ | — |
 | **Custom** | Depends on provider | Self-hosted / private models | Varies | Any OpenAI-compatible endpoint |
@@ -472,6 +484,11 @@ You can use `/web off` to disable this entirely, `/web searxng` to use your self
 - For keyless endpoints (e.g. local Ollama), set `CUSTOM_API_KEY` to any non-empty string like `ollama`
 - Check logs at startup — a successful init prints `✅ Custom provider initialized`
 - Use `/provider custom` to switch to it, then `/models all` to list discovered models
+
+### Vercel provider not appearing
+- Set `VERCEL_API_KEY`
+- Check logs at startup — a successful init prints `✅ Vercel provider initialized`
+- Use `/provider vercel` to switch to it
 
 ### Bot doesn't respond
 1. Check logs: `docker logs -f multi-ai-bot`
@@ -546,8 +563,9 @@ Built with:
 - [OpenRouter](https://openrouter.ai/)
 - [Cerebras](https://cerebras.ai/)
 - [NVIDIA](https://build.nvidia.com/)
+- [Vercel AI Gateway](https://vercel.com/docs/ai-gateway)
 - [Brave Search](https://brave.com/search/api/)
-- [OpenAI Python SDK](https://github.com/openai/openai-python) — used by OpenRouter, NVIDIA, and Custom providers
+- [OpenAI Python SDK](https://github.com/openai/openai-python) — used by OpenRouter, NVIDIA, Vercel, and Custom providers
 
 ---
 

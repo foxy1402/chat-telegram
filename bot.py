@@ -72,6 +72,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+VERCEL_API_KEY = os.getenv("VERCEL_API_KEY")
 
 # Custom provider (OpenAI-compatible endpoint)
 CUSTOM_API_KEY = os.getenv("CUSTOM_API_KEY", "")
@@ -1095,6 +1096,18 @@ class CustomProvider(AIProvider):
         return self.default_model
 
 
+class VercelProvider(CustomProvider):
+    def __init__(self, api_key: str):
+        super().__init__(
+            api_key=api_key,
+            base_url="https://ai-gateway.vercel.sh/v1",
+            default_model="perplexity/sonar",
+        )
+
+    def get_name(self) -> str:
+        return "Vercel"
+
+
 # ============================================================================
 # PROVIDER MANAGER
 # ============================================================================
@@ -1136,6 +1149,12 @@ class ProviderManager:
                 logger.info("✅ NVIDIA provider initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize NVIDIA: {e}")
+        if VERCEL_API_KEY:
+            try:
+                self.providers["vercel"] = VercelProvider(VERCEL_API_KEY)
+                logger.info("✅ Vercel provider initialized")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize Vercel: {e}")
         if CUSTOM_API_KEY and CUSTOM_BASE_URL and CUSTOM_DEFAULT_MODEL:
             try:
                 self.providers["custom"] = CustomProvider(
@@ -2450,6 +2469,7 @@ def main():
         or OPENROUTER_API_KEY
         or CEREBRAS_API_KEY
         or NVIDIA_API_KEY
+        or VERCEL_API_KEY
         or (CUSTOM_API_KEY and CUSTOM_BASE_URL and CUSTOM_DEFAULT_MODEL)
     ):
         raise ValueError("At least one AI provider API key is required!")
