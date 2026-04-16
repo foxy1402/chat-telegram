@@ -11,7 +11,7 @@
 - 🔄 **6 AI Providers** — Groq, Gemini, OpenRouter, Cerebras, NVIDIA, and any Custom OpenAI-compatible endpoint
 - 🖼️ **Image OCR** — Send any photo and the bot extracts text or describes content via NVIDIA vision models
 - 🌐 **Web Search** — AI can search the web for real-time info (Brave API, SearXNG, or DuckDuckGo)
-- 💭 **Thinking Mode** — See AI reasoning traces with NVIDIA models
+- 💭 **Thinking Mode** — See AI reasoning traces with reasoning-capable models across all providers
 - ✅ **Model Validation** — Test which models actually work before using them
 - ⚡ **Easy Switching** — Change providers and models with simple commands
 - 🛑 **Instant Cancel** — `/restart` aborts any stuck or slow AI request immediately, even mid-retry
@@ -277,15 +277,17 @@ Just send a photo — no commands needed.
 - Failed photos in a multi-photo upload are reported inline; remaining photos still process
 - Fully customizable via env vars: `OCR_VISION_MODEL`, `VISION_BASE_URL`, `MAX_IMAGE_BYTES`
 
-### Thinking Mode 💭 (NVIDIA Only)
+### Thinking Mode 💭
 
 | Command | Description |
 |---------|-------------|
-| `/thinking` | Check current thinking mode status |
-| `/thinking on` | Enable — see AI reasoning in responses |
-| `/thinking off` | Disable — get concise responses |
+| `/thinking` | Check current thinking mode status and model support |
+| `/thinking on` | Enable — see AI reasoning traces in responses |
+| `/thinking off` | Disable — hide reasoning, show only final answers |
 
-Only NVIDIA models with a 💭 icon support thinking. The bot will warn you if your current model doesn't support it.
+**Works with all providers!** Reasoning-capable models (DeepSeek-R1, QwQ, Gemini 2.x, etc.) will show their thinking process when enabled. The bot automatically detects and filters thinking tags like `<think>`, `<thinking>`, `<reasoning>`, and `<context>`.
+
+**Note:** When thinking mode is OFF (default), the model still thinks internally but you only see the final answer. Enabling it makes the reasoning visible without changing model behavior (except NVIDIA, which has native server-side control).
 
 ### General
 
@@ -327,12 +329,24 @@ Bot: ✅ Switched to model: deepseek-ai/deepseek-v3.2
 ```
 You: /thinking on
 Bot: ✅ Thinking mode enabled! 💭
+     Provider: custom
+     Model: deepseek-r1-distill-qwen-32b
+     Supports thinking: ✅ Yes
 
 You: Explain quantum computing
-Bot: 💭 **Thinking:**
-     Let me break this down...
-
+Bot: 💭 Thinking:
+     Let me break down quantum computing step by step...
+     First, I need to explain qubits and superposition...
+     
      Quantum computing uses qubits instead of classical bits...
+
+# With thinking OFF (default):
+You: /thinking off
+Bot: 🔕 Thinking mode disabled.
+
+You: Explain quantum computing
+Bot: Quantum computing uses qubits instead of classical bits...
+     (reasoning hidden, only final answer shown)
 ```
 
 ### Image OCR — Single Photo

@@ -438,9 +438,7 @@ async def _chat_with_retry(
         # Interruptible sleep — /restart wakes us immediately
         if cancel_event:
             try:
-                await asyncio.wait_for(
-                    cancel_event.wait(), timeout=delay
-                )
+                await asyncio.wait_for(cancel_event.wait(), timeout=delay)
                 # Event was set — user cancelled
                 raise asyncio.CancelledError("Cancelled by /restart")
             except asyncio.TimeoutError:
@@ -461,12 +459,12 @@ def _trim_history(history: list) -> list:
     dangling half-exchange."""
     if len(history) <= MAX_HISTORY_MESSAGES:
         return history
-    
+
     # Calculate how many pairs to remove (always remove in pairs)
     excess = len(history) - MAX_HISTORY_MESSAGES
     pairs_to_remove = (excess + 1) // 2  # Round up to preserve pairs
     messages_to_remove = pairs_to_remove * 2
-    
+
     # Single O(1) slice operation instead of multiple O(n) pop(0) calls
     del history[:messages_to_remove]
     return history
@@ -547,12 +545,56 @@ def get_model_capability_score(model_id: str) -> tuple:
 # ============================================================================
 
 
+def strip_thinking_tags(text: str, keep_thinking: bool = False) -> str:
+    """
+    Strip or preserve thinking/reasoning tags from AI responses.
+
+    Handles tags like:
+    - <think>...</think>
+    - <thinking>...</thinking>
+    - <context>...</context>
+    - <reasoning>...</reasoning>
+
+    Args:
+        text: The AI response text
+        keep_thinking: If True, formats thinking nicely. If False, removes it entirely.
+
+    Returns:
+        Filtered text
+    """
+    import re
+
+    # Pattern to match thinking-related tags
+    patterns = [
+        (r"<think>(.*?)</think>", "thinking"),
+        (r"<thinking>(.*?)</thinking>", "thinking"),
+        (r"<reasoning>(.*?)</reasoning>", "reasoning"),
+        (r"<context>(.*?)</context>", "context"),
+    ]
+
+    if keep_thinking:
+        # Keep thinking but format it nicely
+        result = text
+        for pattern, label in patterns:
+            matches = re.finditer(pattern, result, re.DOTALL | re.IGNORECASE)
+            for match in reversed(list(matches)):
+                thinking_content = match.group(1).strip()
+                formatted = f"💭 *{label.title()}:*\n{thinking_content}\n\n"
+                result = result[: match.start()] + formatted + result[match.end() :]
+        return result.strip()
+    else:
+        # Remove all thinking tags and their content
+        result = text
+        for pattern, _ in patterns:
+            result = re.sub(pattern, "", result, flags=re.DOTALL | re.IGNORECASE)
+        return result.strip()
+
+
 class AIProvider(ABC):
     def __init__(self):
-        import threading
-
-        self._cached_models = None
         self._models_lock = threading.Lock()
+        self._cached_models = None
+        self._last_refresh = 0
 
     @abstractmethod
     def chat(
@@ -562,6 +604,7 @@ class AIProvider(ABC):
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
     ) -> str:
+        """Generate a chat response from the AI."""
         pass
 
     @abstractmethod
@@ -635,9 +678,10 @@ class GroqProvider(AIProvider):
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        if not response.choices or response.choices[0].message.content is None:
+        content = response.choices[0].message.content if response.choices else None
+        if not content:
             raise ValueError("API returned empty response.")
-        return response.choices[0].message.content
+        return strip_thinking_tags(content, keep_thinking=enable_thinking)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -673,6 +717,11 @@ class GroqProvider(AIProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+    def supports_thinking(self, model_id: str) -> bool:
+        """Groq models may include inline thinking tags in responses."""
+        reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
+        return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
 
 class GeminiProvider(AIProvider):
@@ -712,7 +761,8 @@ class GeminiProvider(AIProvider):
             role = "user" if msg["role"] == "user" else "model"
             chat_history.append({"role": role, "parts": [msg["content"]]})
         chat = gen_model.start_chat(history=chat_history)
-        return chat.send_message(messages[-1]["content"]).text
+        response_text = chat.send_message(messages[-1]["content"]).text
+        return strip_thinking_tags(response_text, keep_thinking=enable_thinking)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -756,6 +806,11 @@ class GeminiProvider(AIProvider):
     def get_default_model(self) -> str:
         return self.default_model
 
+    def supports_thinking(self, model_id: str) -> bool:
+        """Gemini models may include inline thinking tags in responses."""
+        reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1", "gemini-2"]
+        return any(keyword in model_id.lower() for keyword in reasoning_keywords)
+
 
 class OpenRouterProvider(AIProvider):
     def __init__(self, api_key: str):
@@ -783,9 +838,10 @@ class OpenRouterProvider(AIProvider):
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        if not response.choices or response.choices[0].message.content is None:
+        content = response.choices[0].message.content if response.choices else None
+        if not content:
             raise ValueError("API returned empty response.")
-        return response.choices[0].message.content
+        return strip_thinking_tags(content, keep_thinking=enable_thinking)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -853,6 +909,11 @@ class OpenRouterProvider(AIProvider):
     def get_default_model(self) -> str:
         return self.default_model
 
+    def supports_thinking(self, model_id: str) -> bool:
+        """OpenRouter models (especially reasoning models) may include inline thinking tags."""
+        reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
+        return any(keyword in model_id.lower() for keyword in reasoning_keywords)
+
 
 class CerebrasProvider(AIProvider):
     def __init__(self, api_key: str):
@@ -879,9 +940,10 @@ class CerebrasProvider(AIProvider):
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        if not response.choices or response.choices[0].message.content is None:
+        content = response.choices[0].message.content if response.choices else None
+        if not content:
             raise ValueError("API returned empty response.")
-        return response.choices[0].message.content
+        return strip_thinking_tags(content, keep_thinking=enable_thinking)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -916,6 +978,11 @@ class CerebrasProvider(AIProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+    def supports_thinking(self, model_id: str) -> bool:
+        """Cerebras models may include inline thinking tags in responses."""
+        reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
+        return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
 
 class NvidiaProvider(AIProvider):
@@ -1001,7 +1068,10 @@ class NvidiaProvider(AIProvider):
             {"id": "qwen/qwen3-coder-480b-a35b-instruct", "name": "Qwen3 Coder 480B"},
             {"id": "minimaxai/minimax-m2.1", "name": "MiniMax M2.1"},
             {"id": "minimaxai/minimax-m2", "name": "MiniMax M2"},
-            {"id": "nvidia/nemotron-3-super-120b-a12b", "name": "NVIDIA-Nemotron-3-Super-120B-A12B 💭"},
+            {
+                "id": "nvidia/nemotron-3-super-120b-a12b",
+                "name": "NVIDIA-Nemotron-3-Super-120B-A12B 💭",
+            },
             {"id": "deepseek-ai/deepseek-v3.2", "name": "DeepSeek V3.2 💭"},
             {
                 "id": "deepseek-ai/deepseek-v3.1-terminus",
@@ -1036,6 +1106,14 @@ class CustomProvider(AIProvider):
         self.base_url = base_url
         self.default_model = default_model
 
+    def supports_thinking(self, model_id: str) -> bool:
+        """
+        Custom provider supports thinking for models that return inline thinking tags.
+        Override this or configure per-model if needed.
+        """
+        # By default, assume all custom models may include thinking tags
+        return True
+
     def chat(
         self,
         messages: List[Dict],
@@ -1053,9 +1131,12 @@ class CustomProvider(AIProvider):
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        if not response.choices or response.choices[0].message.content is None:
+        content = response.choices[0].message.content if response.choices else None
+        if not content:
             raise ValueError("API returned empty response.")
-        return response.choices[0].message.content
+
+        # Filter thinking tags based on enable_thinking flag
+        return strip_thinking_tags(content, keep_thinking=enable_thinking)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -1764,6 +1845,7 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     session = get_user_session(user_id)
     provider_name, provider = _resolve_provider(session)
+
     if not context.args:
         state = "enabled" if session.get("thinking_enabled", False) else "disabled"
         await update.message.reply_text(
@@ -1771,25 +1853,22 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
+
     arg = context.args[0].lower()
     if arg == "on":
         session["thinking_enabled"] = True
-        if provider_name == "nvidia":
-            current_model = (
-                session["models"].get(provider_name) or provider.get_default_model()
-            )
-            ok = provider.supports_thinking(current_model)
-            await update.message.reply_text(
-                f"✅ *Thinking mode enabled!* 💭\n\n"
-                f"`{current_model}` {'supports' if ok else 'does NOT support'} thinking.",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text(
-                f"✅ *Thinking mode enabled!*\n\nOnly NVIDIA supports thinking. "
-                f"Use `/provider nvidia` to switch.",
-                parse_mode="Markdown",
-            )
+        current_model = (
+            session["models"].get(provider_name) or provider.get_default_model()
+        )
+        supports = provider.supports_thinking(current_model)
+
+        await update.message.reply_text(
+            f"✅ *Thinking mode enabled!* 💭\n\n"
+            f"Provider: `{provider_name}`\n"
+            f"Model: `{current_model}`\n"
+            f"Supports thinking: {'✅ Yes' if supports else '⚠️ No'}",
+            parse_mode="Markdown",
+        )
     elif arg == "off":
         session["thinking_enabled"] = False
         await update.message.reply_text(
@@ -2509,3 +2588,62 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================================
+# TESTS (commented out - uncomment to run)
+# ============================================================================
+
+# def test_strip_thinking_tags():
+#     """Test the strip_thinking_tags function with various inputs."""
+#
+#     # Test 1: Simple <think> tag removal
+#     input1 = """<think>
+# The user is asking who is the USA president now. The current date is Thursday, April 16, 2026, 9:57:20 AM UTC.
+#
+# Looking at the search results:
+# - Donald Trump is the 47th president of the United States
+# </think>
+#
+# Donald Trump is the 47th president of the United States. He was inaugurated on January 20, 2025."""
+#
+#     result_no_thinking = strip_thinking_tags(input1, keep_thinking=False)
+#     print("Test 1 - Remove thinking:")
+#     print(result_no_thinking)
+#     print("\n" + "="*80 + "\n")
+#
+#     result_keep_thinking = strip_thinking_tags(input1, keep_thinking=True)
+#     print("Test 1 - Keep thinking:")
+#     print(result_keep_thinking)
+#     print("\n" + "="*80 + "\n")
+#
+#     # Test 2: Multiple tag types
+#     input2 = """<thinking>Let me analyze this question...</thinking>
+#
+# <reasoning>Based on the data, I conclude...</reasoning>
+#
+# Here is the final answer: 42
+#
+# <context>Additional information from search results</context>"""
+#
+#     result2_no = strip_thinking_tags(input2, keep_thinking=False)
+#     print("Test 2 - Remove all tags:")
+#     print(result2_no)
+#     print("\n" + "="*80 + "\n")
+#
+#     result2_keep = strip_thinking_tags(input2, keep_thinking=True)
+#     print("Test 2 - Keep and format tags:")
+#     print(result2_keep)
+#     print("\n" + "="*80 + "\n")
+#
+#     # Test 3: No thinking tags
+#     input3 = "This is a normal response without any thinking tags."
+#     result3 = strip_thinking_tags(input3, keep_thinking=False)
+#     print("Test 3 - No tags:")
+#     print(result3)
+#     print("\n" + "="*80 + "\n")
+#
+#     print("All tests completed!")
+#
+# # Uncomment to run tests:
+# # test_strip_thinking_tags()

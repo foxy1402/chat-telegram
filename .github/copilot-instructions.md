@@ -81,6 +81,36 @@ Search results are **not** added to conversation history to avoid context pollut
 
 ---
 
+## Thinking Tag Filtering
+
+### Universal Tag Stripping: `strip_thinking_tags()`
+
+Located at **line 550**, this utility function handles inline thinking tags across all providers:
+
+```python
+def strip_thinking_tags(text: str, keep_thinking: bool = False) -> str
+```
+
+**Supported Tags:**
+- `<think>...</think>`
+- `<thinking>...</thinking>`
+- `<reasoning>...</reasoning>`
+- `<context>...</context>`
+
+**Behavior:**
+- `keep_thinking=False` → Removes all thinking content (default)
+- `keep_thinking=True` → Formats thinking with emoji headers
+
+**Integration:** Every provider's `chat()` method calls this before returning:
+```python
+content = response.choices[0].message.content
+return strip_thinking_tags(content, keep_thinking=enable_thinking)
+```
+
+**NVIDIA Exception:** NVIDIA uses native streaming with `reasoning_content` field, bypasses tag filtering.
+
+---
+
 ## Key Conventions
 
 ### Message Splitting
@@ -106,9 +136,17 @@ Commands:
 
 All providers inject `SYSTEM_PROMPT` automatically if not present in messages. Search-enabled requests use a **dynamic system prompt** (`SYSTEM_PROMPT + get_search_prompt()`).
 
-### Thinking Mode (NVIDIA only)
+### Thinking Mode (All Providers)
 
-NVIDIA models with reasoning support (e.g., `deepseek-ai/deepseek-v3.2`) can expose thinking traces when `/thinking on` is enabled. The bot checks `supports_thinking(model_id)` before allowing this feature.
+Models with reasoning support can expose thinking traces when `/thinking on` is enabled. The bot uses `strip_thinking_tags()` (line 550) to filter inline thinking tags like `<think>`, `<thinking>`, `<reasoning>`, and `<context>`.
+
+**Provider-Specific Behavior:**
+- **NVIDIA:** Native streaming API with separate `reasoning_content` field
+- **All Others:** Inline XML-style tags filtered via regex
+
+**Tag Filtering:** When `/thinking off` (default), all thinking content is removed. When `/thinking on`, thinking is formatted with `💭 *Thinking:*` headers.
+
+**Model Detection:** Each provider implements `supports_thinking(model_id)` to detect reasoning-capable models by keywords like "reasoning", "think", "deepseek", "qwq", "r1".
 
 ---
 
@@ -163,9 +201,14 @@ Flashed as `main.py` (auto-runs on boot). See `ESP32-GUIDE.md` for setup instruc
            self.api_key = api_key
            self.default_model = "model-id"
        
-       def chat(self, messages, model=None, enable_thinking=False):
+       def chat(self, messages, model=None, enable_thinking=False, max_tokens=None):
            # Implement API call logic
-           pass
+           response = self.client.chat.completions.create(...)
+           content = response.choices[0].message.content
+           if not content:
+               raise ValueError("API returned empty response.")
+           # IMPORTANT: Filter thinking tags
+           return strip_thinking_tags(content, keep_thinking=enable_thinking)
        
        def get_available_models(self):
            # Fetch from API or return hardcoded list
@@ -176,6 +219,11 @@ Flashed as `main.py` (auto-runs on boot). See `ESP32-GUIDE.md` for setup instruc
        
        def get_default_model(self):
            return self.default_model
+       
+       def supports_thinking(self, model_id: str) -> bool:
+           # Detect reasoning-capable models
+           reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
+           return any(keyword in model_id.lower() for keyword in reasoning_keywords)
    ```
 
 2. **Add to `ProviderManager`** (around line 800-900):
@@ -185,11 +233,14 @@ Flashed as `main.py` (auto-runs on boot). See `ESP32-GUIDE.md` for setup instruc
 
 3. **Update README.md** with provider details and free tier limits.
 
-4. **(Optional)** Add thinking support:
+4. **Thinking Support:** Implement `supports_thinking()` for reasoning models:
    ```python
-   def supports_thinking(self, model_id):
-       return "reasoning-model" in model_id
+   def supports_thinking(self, model_id: str) -> bool:
+       reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
+       return any(keyword in model_id.lower() for keyword in reasoning_keywords)
    ```
+   
+   **Note:** `strip_thinking_tags()` is called automatically in `chat()`, so no additional logic needed unless using custom streaming (like NVIDIA).
 
 ---
 
