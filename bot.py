@@ -65,7 +65,7 @@ except ValueError:
 try:
     MAX_SNIPPET_LEN = int(os.getenv("MAX_SNIPPET_LEN", "500"))
 except ValueError:
-    MAX_SNIPPET_LEN = 300
+    MAX_SNIPPET_LEN = 500
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -268,11 +268,11 @@ def _parse_search_query(response: str) -> Optional[str]:
     m = re.match(r"^[\w\s\-'\".,/&+%@#()]+", raw, re.UNICODE)
     raw = m.group(0).strip() if m else ""
 
-    # Cap at 10 words to prevent explanatory bleed-through
-    # (prompt requests 2-6 words; 10 gives headroom for longer queries)
+    # Cap at 12 words to prevent explanatory bleed-through
+    # (prompt requests 4-8 words; 12 gives headroom for longer self-contained queries)
     words = raw.split()
-    if len(words) > 10:
-        raw = " ".join(words[:10])
+    if len(words) > 12:
+        raw = " ".join(words[:12])
 
     raw = raw[:120]
     return raw if len(raw) >= 2 else None
@@ -563,8 +563,6 @@ def strip_thinking_tags(text: str, keep_thinking: bool = False) -> str:
     Returns:
         Filtered text
     """
-    import re
-
     # Pattern to match thinking-related tags
     patterns = [
         (r"<think>(.*?)</think>", "thinking"),
@@ -1041,12 +1039,22 @@ class NvidiaProvider(AIProvider):
                 full = "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n"
             return full + "".join(content_parts)
         else:
+            # For thinking-capable models, explicitly disable thinking so the
+            # model doesn't burn its token budget on internal reasoning and
+            # return content=None (a NVIDIA-side quirk on models like
+            # nvidia/nemotron-3-super-120b-a12b).
+            extra_body = (
+                {"chat_template_kwargs": {"thinking": False}}
+                if self.supports_thinking(model)
+                else {}
+            )
             response = self.client.chat.completions.create(
                 messages=chat_messages,
                 model=model,
                 temperature=TEMPERATURE,
                 max_tokens=max_tokens or MAX_TOKENS,
                 stream=False,
+                **({"extra_body": extra_body} if extra_body else {}),
             )
             content = response.choices[0].message.content if response.choices else None
             if not content:
