@@ -12,11 +12,11 @@
 - 🖼️ **Image OCR** — Send any photo and the bot extracts text or describes content via NVIDIA vision models
 - 🌐 **Web Search** — AI can search the web for real-time info (Brave API, SearXNG, or DuckDuckGo)
 - 💭 **Thinking Mode** — See AI reasoning traces with reasoning-capable models across all providers
+- 🧠 **Smart Memory** — Claude-style rolling compaction silently summarises old messages into structured long-term memory so the bot remembers across hundreds of turns (zero config, fully background)
 - ✅ **Model Validation** — Test which models actually work before using them
 - ⚡ **Easy Switching** — Change providers and models with simple commands
 - 🛑 **Instant Cancel** — `/restart` aborts any stuck or slow AI request immediately, even mid-retry
 - 🔒 **User Whitelisting** — Restrict access to specific Telegram users
-- 💬 **Conversation History** — Context maintained across messages (including after OCR)
 - 🆓 **100% Free** — Uses only free-tier APIs (no credit card required)
 - 🐳 **Docker Ready** — Pre-built image on GitHub Container Registry (GHCR)
 
@@ -224,6 +224,28 @@ MAX_SEARCH_RESULTS=5
 MAX_SNIPPET_LEN=300
 ```
 
+### Smart Memory tuning (advanced, optional)
+
+You **don't need to set any of these** — the defaults already give you Claude-style rolling memory out of the box. Only touch these if you want to tune the trade-off between memory length and API cost.
+
+```env
+# When history exceeds this many messages, fold the older portion into a
+# rolling summary. Default: matches MAX_HISTORY_MESSAGES.
+COMPACT_THRESHOLD=20
+
+# How many recent messages to keep verbatim after compaction (must be even,
+# user+assistant pairs). Higher = more high-fidelity recent context.
+COMPACT_KEEP_RECENT=8
+
+# Hard cap on the rolling-memory document (characters). Higher = more long-
+# term recall but more tokens added to every system prompt.
+MAX_SUMMARY_CHARS=4000
+
+# Token budget for the summariser LLM call. Compaction runs in the
+# background so this rarely affects user-perceived latency.
+COMPACT_MAX_TOKENS=1500
+```
+
 ---
 
 ## 💬 Bot Commands
@@ -294,8 +316,9 @@ Just send a photo — no commands needed.
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome message with status overview |
-| `/clear` | Clear conversation history |
-| `/restart` | Abort any stuck or slow in-flight AI request |
+| `/status` | One-screen view of provider, model, toggles, history size & memory size |
+| `/clear` | Clear conversation history **and** rolling memory |
+| `/restart` | Abort any stuck or slow in-flight AI request (also cancels background memory compaction) |
 | `/help` | Full command reference |
 
 ---
@@ -425,15 +448,13 @@ You: explain the entire history of the universe in detail
      (Bot is thinking... nothing arrives for 5 minutes)
 
 You: /restart
-Bot: 🛑 Restart requested.
-     Any pending AI request has been signalled to stop.
-     You can send a new message now.
+Bot: 🛑 Restart requested. You can send a new message now.
 
 You: actually just give me a one-line summary
 Bot: The universe began ~13.8 billion years ago with the Big Bang and has been expanding ever since.
 ```
 
-`/restart` works at any point — whether the bot is waiting for the first response, sleeping between retries, or doing a web search decision call.
+`/restart` works at any point — whether the bot is waiting for the first response, sleeping between retries, doing a web search decision call, or running a background memory compaction.
 
 ---
 
@@ -487,6 +508,41 @@ The API call is retried up to 2 times on transient errors (rate limits, timeouts
 5. **AI returns an up-to-date response** — grounded in the fetched snippets
 
 You can use `/web off` to disable this entirely, `/web searxng` to use your self-hosted SearXNG instance, or `/web ddg` to use the free DuckDuckGo engine without any API key. Brave is the default engine for best result quality.
+
+---
+
+## 🧠 How Smart Memory Works
+
+The bot uses a **Claude-style two-tier memory** so it never forgets old context, even after hundreds of messages — without ballooning the context window on every API call.
+
+**Tier 1 — Recent verbatim** (the last 8 messages): kept exactly as written for high-fidelity recent context.
+
+**Tier 2 — Rolling memory** (structured summary): when history grows past 20 messages, the older portion is silently folded into a structured memory document under fixed sections:
+
+```
+USER PROFILE:        — name, role, language, tooling, persona
+PREFERENCES & STYLE: — how they want responses (length, tone, format)
+ONGOING PROJECTS:    — projects, repos, files, products being worked on
+KEY FACTS:           — dates, names, numbers, IDs, URLs, configs
+DECISIONS:           — what was agreed/chosen and WHY
+OPEN QUESTIONS:      — pending items, promised follow-ups
+IMPORTANT SNIPPETS:  — critical code, values, error messages
+```
+
+This memory lives in the system prompt on every subsequent chat call, so the bot stays aware of who you are and what you're working on across very long conversations.
+
+### How it stays invisible
+
+- Compaction runs as a **fire-and-forget background task after the reply has already been sent** — you see zero latency on the current message
+- Per-session lock prevents double-compaction even if you send messages rapidly
+- The summarisation step is **incremental**: each new compaction feeds the previous memory + the next chunk of old messages back into the model, so facts persist across many compactions
+- Memory is bounded at 4,000 chars (about 1,000 tokens) — fixed cost added to the system prompt
+- `/restart`, `/clear` and `/provider` automatically cancel any in-flight compaction so they never write a stale summary back over reset state
+- View current memory size at any time with `/status`
+
+### Zero config — defaults work for everyone
+
+You don't need to set any env vars for this feature. If you want to tune it, see the [Smart Memory tuning](#smart-memory-tuning-advanced-optional) section below.
 
 ---
 

@@ -47,6 +47,40 @@ try:
     MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))  # must be even
 except ValueError:
     MAX_HISTORY_MESSAGES = 20
+
+# ── SMART COMPACTION (Claude-style rolling memory) ─────────────────────────
+# When history grows past COMPACT_THRESHOLD, the older portion is rolled into
+# a structured summary stored in session["summary"]. The newest
+# COMPACT_KEEP_RECENT messages are always kept verbatim for high-fidelity
+# recent context. The summary is appended to the system prompt on every
+# subsequent chat call, so the bot keeps a long-term memory of facts,
+# decisions, preferences and ongoing topics without paying for the full
+# raw transcript every turn.
+try:
+    COMPACT_THRESHOLD = int(
+        os.getenv("COMPACT_THRESHOLD", str(MAX_HISTORY_MESSAGES))
+    )
+except ValueError:
+    COMPACT_THRESHOLD = MAX_HISTORY_MESSAGES
+try:
+    COMPACT_KEEP_RECENT = int(os.getenv("COMPACT_KEEP_RECENT", "8"))
+except ValueError:
+    COMPACT_KEEP_RECENT = 8
+# Must keep at least one pair and stay on a pair boundary (even number)
+if COMPACT_KEEP_RECENT < 2:
+    COMPACT_KEEP_RECENT = 2
+if COMPACT_KEEP_RECENT % 2:
+    COMPACT_KEEP_RECENT += 1
+try:
+    MAX_SUMMARY_CHARS = int(os.getenv("MAX_SUMMARY_CHARS", "4000"))
+except ValueError:
+    MAX_SUMMARY_CHARS = 4000
+try:
+    COMPACT_MAX_TOKENS = int(os.getenv("COMPACT_MAX_TOKENS", "1500"))
+except ValueError:
+    COMPACT_MAX_TOKENS = 1500
+COMPACT_TIMEOUT = 60.0  # seconds — one-shot timeout for the summarizer call
+
 MAX_MESSAGE_LENGTH = 4096
 MAX_INPUT_LENGTH = (
     4000  # Reject user messages above this to protect memory and API costs
@@ -157,11 +191,86 @@ _PROMPT_SEARCH_RESULTS = (
 SYSTEM_PROMPT = _PROMPT_BASE
 SYSTEM_PROMPT_WITH_RESULTS = _PROMPT_BASE + _PROMPT_SEARCH_RESULTS
 
+# ── COMPACTION SUMMARIZER PROMPT ───────────────────────────────────────────
+# Folds older messages into a structured "rolling memory" document.
+# Designed to be FED ITSELF on next compaction (rolling / incremental
+# summarisation) — same pattern Claude uses for /compact.
+_PROMPT_COMPACT_SUMMARIZER = (
+    "You are a conversation memory compactor. Your job is to produce a "
+    "dense, structured rolling memory of an ongoing chat so the assistant "
+    "can keep helping the user without re-reading old messages.\n\n"
+    "You will receive:\n"
+    "  1. (Optional) the PREVIOUS rolling memory from earlier compactions.\n"
+    "  2. NEW transcript chunk to fold in.\n\n"
+    "Produce ONE updated memory document using EXACTLY these sections "
+    "(omit a section entirely if it has zero content):\n\n"
+    "USER PROFILE:\n"
+    "- Name, role, location, language preference, tooling, skill level, persona — anything stable about the user.\n\n"
+    "PREFERENCES & STYLE:\n"
+    "- How they want responses (length, tone, format, code style, response language).\n\n"
+    "ONGOING PROJECTS & TOPICS:\n"
+    "- Projects, repos, files, products, or domains being worked on.\n\n"
+    "KEY FACTS ESTABLISHED:\n"
+    "- Concrete facts the assistant must remember: dates, names, numbers, IDs, URLs, configurations, versions.\n\n"
+    "DECISIONS & CONCLUSIONS:\n"
+    "- What was agreed/chosen/ruled out and WHY.\n\n"
+    "OPEN QUESTIONS / PENDING:\n"
+    "- Anything unresolved, promised follow-ups, things the user is still considering.\n\n"
+    "IMPORTANT SNIPPETS:\n"
+    "- Critical code, values, error messages, identifiers that may need to be quoted verbatim later.\n\n"
+    "RULES:\n"
+    "- Write in compact bullet points. No fluff, no preamble, no apology.\n"
+    "- Preserve EXACT identifiers (names, paths, versions, error codes, numbers).\n"
+    "- MERGE new info into the previous memory — don't just append. Update outdated facts. Drop facts the user has corrected or retracted.\n"
+    "- Drop trivia: greetings, small talk, retries, transient errors that were resolved.\n"
+    "- If a section has nothing, omit it entirely (no empty headers).\n"
+    "- Keep total length under {max_chars} characters.\n"
+    "- Output ONLY the memory document. No 'Here is the summary' wrapper, no markdown fences."
+)
+
 
 def _make_search_decision_prompt() -> str:
     """Build the standalone search-router prompt with today's date injected."""
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     return _PROMPT_SEARCH_DECISION.format(date=today)
+
+
+def _make_compact_summarizer_prompt() -> str:
+    """Build the rolling-memory summarizer prompt with the char cap injected."""
+    return _PROMPT_COMPACT_SUMMARIZER.format(max_chars=MAX_SUMMARY_CHARS)
+
+
+def _serialize_history_for_summary(messages: List[Dict]) -> str:
+    """Render a list of {role, content} messages as plain transcript for the summarizer."""
+    role_label = {"user": "USER", "assistant": "ASSISTANT", "system": "SYSTEM"}
+    lines = []
+    for msg in messages:
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        label = role_label.get(msg.get("role", "?"), msg.get("role", "?").upper())
+        lines.append(f"{label}: {content}")
+    return "\n\n".join(lines)
+
+
+def _build_system_prompt(session: Dict, base: str = None) -> str:
+    """Return the system prompt with the rolling memory appended (if any).
+
+    Called once per chat request to produce the system message that gets
+    prepended to messages going to the LLM. The summary is treated as
+    authoritative background knowledge about this user and chat history.
+    """
+    if base is None:
+        base = SYSTEM_PROMPT
+    summary = (session.get("summary") or "").strip()
+    if not summary:
+        return base
+    return (
+        f"{base}\n\n"
+        "ROLLING CONVERSATION MEMORY (compacted from earlier messages — "
+        "treat as authoritative background knowledge about this user and chat):\n"
+        f"{summary}"
+    )
 
 
 # ============================================================================
@@ -455,20 +564,217 @@ async def _chat_with_retry(
 
 
 def _trim_history(history: list) -> list:
-    """Trim history to MAX_HISTORY_MESSAGES keeping complete user/assistant pairs.
-    Always removes the oldest pair (2 messages) so the model never sees a
-    dangling half-exchange."""
+    """Hard-cap fallback: trim history to MAX_HISTORY_MESSAGES keeping complete
+    user/assistant pairs. Used as a safety net when compaction is unavailable
+    or fails — the rolling-summary path (_compact_history) is the primary
+    mechanism for context management.
+    """
     if len(history) <= MAX_HISTORY_MESSAGES:
         return history
 
-    # Calculate how many pairs to remove (always remove in pairs)
     excess = len(history) - MAX_HISTORY_MESSAGES
     pairs_to_remove = (excess + 1) // 2  # Round up to preserve pairs
     messages_to_remove = pairs_to_remove * 2
-
-    # Single O(1) slice operation instead of multiple O(n) pop(0) calls
     del history[:messages_to_remove]
     return history
+
+
+async def _compact_history(
+    session: Dict,
+    provider,
+    model: Optional[str],
+    *,
+    force: bool = False,
+) -> bool:
+    """Roll older messages into session['summary'] and truncate history.
+
+    This is the Claude-style /compact equivalent: instead of dropping old
+    messages, we ask the LLM to fold them into a structured rolling memory
+    that lives in the system prompt on every subsequent call.
+
+    Semantics:
+    - History is split at a user/assistant pair boundary so we never strand
+      a dangling half-exchange.
+    - The last COMPACT_KEEP_RECENT messages remain verbatim (high-fidelity
+      recent context).
+    - Everything older is sent to the summarizer ALONG WITH the previous
+      rolling memory so summarisation is incremental — old facts persist
+      across many compactions.
+    - Compaction holds a per-session asyncio.Lock so two near-simultaneous
+      messages can't double-compact.
+    - On any failure we fall back to _trim_history so memory stays bounded.
+
+    Returns True if a compaction was performed, False otherwise.
+    """
+    lock: Optional[asyncio.Lock] = session.get("compact_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        session["compact_lock"] = lock
+
+    async with lock:
+        # Capture the live list reference. After the await we'll verify it
+        # hasn't been swapped out from under us by /clear or /provider.
+        original_history = session["history"]
+        history = original_history
+
+        if not force and len(history) <= COMPACT_THRESHOLD:
+            return False
+
+        # Need at least one full pair to compact beyond the keep-recent tier
+        if len(history) < COMPACT_KEEP_RECENT + 2:
+            return False
+
+        # Split on a pair boundary so the kept tail starts with a USER turn
+        split_at = len(history) - COMPACT_KEEP_RECENT
+        if split_at % 2:
+            split_at -= 1
+        if split_at < 2:
+            return False
+
+        to_summarize = history[:split_at]
+        previous_summary = (session.get("summary") or "").strip()
+
+        sys_prompt = _make_compact_summarizer_prompt()
+        user_parts = []
+        if previous_summary:
+            user_parts.append("PREVIOUS ROLLING MEMORY:\n" + previous_summary)
+        user_parts.append(
+            "NEW TRANSCRIPT CHUNK TO FOLD IN:\n"
+            + _serialize_history_for_summary(to_summarize)
+        )
+        user_parts.append(
+            "Produce the updated rolling memory now, following the format and rules above."
+        )
+        summary_msgs = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": "\n\n".join(user_parts)},
+        ]
+
+        logger.info(
+            f"[Compact] Compressing {len(to_summarize)} old msgs → memory, "
+            f"keeping ≥{len(history) - split_at} recent verbatim (force={force}, "
+            f"prev_summary={len(previous_summary)} chars)"
+        )
+
+        try:
+            new_summary = await asyncio.wait_for(
+                asyncio.to_thread(
+                    provider.chat,
+                    messages=summary_msgs,
+                    model=model,
+                    enable_thinking=False,
+                    max_tokens=COMPACT_MAX_TOKENS,
+                ),
+                timeout=COMPACT_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            # /restart, /clear or /provider cancelled this background task.
+            # Don't touch state — the user wants a clean slate.
+            logger.info("[Compact] Cancelled by user action.")
+            raise
+        except Exception as e:
+            logger.warning(
+                f"[Compact] Summariser call failed: {e}. Falling back to hard trim."
+            )
+            # Only trim if the live history is still the same list — otherwise
+            # /clear or /provider already reset state and we'd corrupt it.
+            if session["history"] is original_history:
+                _trim_history(original_history)
+            return False
+
+        # RACE GUARD — if /clear or /provider replaced the history list while
+        # we were awaiting the LLM, abort: don't write a stale summary against
+        # a freshly-reset session.
+        if session["history"] is not original_history:
+            logger.info(
+                "[Compact] Session was reset during compaction; discarding stale summary."
+            )
+            return False
+
+        new_summary = strip_thinking_tags(new_summary or "", keep_thinking=False).strip()
+        if not new_summary:
+            logger.warning(
+                "[Compact] Empty summary returned. Falling back to hard trim."
+            )
+            _trim_history(original_history)
+            return False
+
+        if len(new_summary) > MAX_SUMMARY_CHARS:
+            new_summary = (
+                new_summary[:MAX_SUMMARY_CHARS].rstrip() + "\n…[truncated]"
+            )
+
+        # In-place delete preserves any messages the user appended during
+        # our await window — fixes the silent-message-loss bug where
+        # session["history"] = to_keep would clobber concurrent appends.
+        del original_history[:split_at]
+        session["summary"] = new_summary
+        logger.info(
+            f"[Compact] Done. summary={len(new_summary)} chars, "
+            f"history={len(original_history)} msgs verbatim"
+        )
+        return True
+
+
+async def _maybe_compact(session: Dict, provider, model: Optional[str]) -> None:
+    """Fire compaction if history is over threshold. Never raises."""
+    try:
+        if len(session["history"]) > COMPACT_THRESHOLD:
+            await _compact_history(session, provider, model)
+        else:
+            # Belt-and-braces: still apply the hard cap if the compact path
+            # was skipped (shouldn't happen unless threshold > max).
+            _trim_history(session["history"])
+    except Exception as e:
+        logger.warning(f"[Compact] _maybe_compact error: {e}")
+        _trim_history(session["history"])
+
+
+def _schedule_compact(session: Dict, provider, model: Optional[str]) -> None:
+    """Schedule rolling-memory compaction as a fire-and-forget background task.
+
+    Keeps a strong reference to the task in session["_bg_tasks"] so the
+    event loop can't GC it mid-flight (per asyncio docs). The per-session
+    asyncio.Lock inside _compact_history serialises concurrent compactions,
+    so it's always safe to schedule another one.
+
+    The user never sees this: the handler returns to Telegram immediately
+    and the summariser call runs invisibly in the background.
+    """
+    try:
+        task = asyncio.create_task(_maybe_compact(session, provider, model))
+    except RuntimeError:
+        # No running event loop (shouldn't happen inside a handler) —
+        # fall back to the synchronous hard cap so memory still stays bounded.
+        _trim_history(session["history"])
+        return
+    bg: set = session.setdefault("_bg_tasks", set())
+    bg.add(task)
+    task.add_done_callback(bg.discard)
+
+
+def _cancel_bg_tasks(session: Dict) -> int:
+    """Cancel every in-flight background task on this session (e.g. compaction).
+
+    Called from /restart, /clear and /provider so a hard state reset also
+    aborts any pending summariser call. The underlying provider thread
+    can't actually be killed (asyncio.to_thread limitation) but cancelling
+    the task makes asyncio.wait_for raise CancelledError inside the
+    coroutine, which bypasses the summary-write step cleanly.
+
+    Returns the number of tasks cancelled.
+    """
+    bg = session.get("_bg_tasks")
+    if not bg:
+        return 0
+    cancelled = 0
+    for task in list(bg):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+    if cancelled:
+        logger.info(f"[Compact] Cancelled {cancelled} in-flight background task(s).")
+    return cancelled
 
 
 async def reply_text_safe(message, text: str):
@@ -1301,12 +1607,19 @@ def get_user_session(user_id: str) -> Dict:
             "provider": provider_manager.get_default_provider(),
             "models": {},
             "history": [],
+            # Rolling-memory summary (Claude-style /compact). Updated after
+            # every conversation that exceeds COMPACT_THRESHOLD. Always
+            # appended to the system prompt on subsequent chat calls.
+            "summary": "",
             "thinking_enabled": False,
             "web_search": True,
             "search_engine": default_engine,
             "last_seen": now,
             # asyncio.Event used by /restart to abort in-flight LLM calls
             "cancel_event": asyncio.Event(),
+            # Per-session lock so two near-simultaneous messages can't
+            # double-compact and stomp on each other's summary.
+            "compact_lock": asyncio.Lock(),
         }
     else:
         user_sessions[user_id]["last_seen"] = now
@@ -1524,12 +1837,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 Web Search: {web_status}\n\n"
         f"Just send me a message or a photo!\n\n"
         f"*Commands:*\n"
+        f"/status - Show current settings & stats\n"
         f"/provider - Switch AI provider\n"
         f"/models - List available models\n"
         f"/model - Switch model\n"
         f"/web - Toggle web search\n"
         f"/refresh - Refresh model lists\n"
-        f"/clear - Clear conversation history\n"
+        f"/clear - Clear conversation\n"
         f"/restart - Cancel any stuck/pending AI request\n"
         f"/help - Show help",
         parse_mode="Markdown",
@@ -1543,8 +1857,15 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⛔ Sorry, you're not authorized to use this bot."
         )
         return
-    get_user_session(user_id)["history"] = []
-    await update.message.reply_text("🗑️ Conversation history cleared!")
+    session = get_user_session(user_id)
+    # Abort any in-flight background compaction first so it can't write a
+    # stale summary back over the freshly-cleared state.
+    _cancel_bg_tasks(session)
+    session["history"] = []
+    session["summary"] = ""
+    await update.message.reply_text(
+        "🗑️ Conversation history and rolling memory cleared!"
+    )
 
 
 async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1595,7 +1916,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Add a caption to ask a specific question about the image\n"
         "• Requires `NVIDIA_API_KEY` to be set\n\n"
         "*Other:*\n"
-        "• `/clear` — clear conversation history\n"
+        "• `/status` — show provider, model, toggles & stats\n"
+        "• `/clear` — clear conversation\n"
         "• `/restart` — cancel any stuck/pending AI request\n"
         "• `/help` — this message",
         parse_mode="Markdown",
@@ -1627,8 +1949,13 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Available: {', '.join(provider_manager.list_providers())}"
         )
         return
+    # Cancel any pending background compaction on the OLD provider before
+    # we swap — otherwise its summary could land in the new provider's session.
+    _cancel_bg_tasks(session)
     session["provider"] = new_name
-    session["history"] = []  # Clear history — context from old provider is incompatible
+    # Old provider may have produced incompatible context formatting / summary
+    session["history"] = []
+    session["summary"] = ""
     current_model = session["models"].get(new_name) or new_provider.get_default_model()
     await update.message.reply_text(
         f"✅ Switched to *{new_provider.get_name()}*!\nModel: `{current_model}`",
@@ -1980,6 +2307,50 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================================
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show a concise one-screen status: provider, model, toggles, memory."""
+    user_id = str(update.effective_user.id)
+    if not is_user_allowed(user_id):
+        await update.message.reply_text(
+            "⛔ Sorry, you're not authorized to use this bot."
+        )
+        return
+
+    session = get_user_session(user_id)
+    provider_name, provider = _resolve_provider(session)
+    current_model = session["models"].get(provider_name) or provider.get_default_model()
+
+    web_on = session.get("web_search", True)
+    engine = session.get("search_engine", "duckduckgo")
+    engine_label = {"brave": "Brave", "searxng": "SearXNG", "duckduckgo": "DuckDuckGo"}.get(
+        engine, engine
+    )
+    web_line = f"ON ({engine_label})" if web_on else "OFF"
+
+    thinking_on = session.get("thinking_enabled", False)
+    # Thinking is only honoured by NVIDIA today — flag that clearly so the
+    # status doesn't lie when the user toggled it on a non-NVIDIA provider.
+    if thinking_on and provider_name != "nvidia":
+        thinking_line = "ON (NVIDIA only — ignored here)"
+    else:
+        thinking_line = "ON" if thinking_on else "OFF"
+
+    history_len = len(session.get("history", []))
+    summary_chars = len((session.get("summary") or "").strip())
+    memory_line = f"{summary_chars:,} chars" if summary_chars else "empty"
+
+    await update.message.reply_text(
+        f"📊 *Status*\n"
+        f"📡 Provider: *{provider.get_name()}*\n"
+        f"🧠 Model: `{current_model}`\n"
+        f"🌐 Web: {web_line}\n"
+        f"💭 Thinking: {thinking_line}\n"
+        f"💬 History: {history_len} msgs\n"
+        f"📜 Memory: {memory_line}",
+        parse_mode="Markdown",
+    )
+
+
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel an in-flight AI request that is taking too long.
 
@@ -1997,15 +2368,16 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     session = get_user_session(user_id)
     cancel_event: asyncio.Event = session["cancel_event"]
-    cancel_event.set()  # signal any in-flight call to abort
+    cancel_event.set()  # signal any in-flight answer LLM call to abort
+    # Also cancel any background compaction so we don't waste API calls on
+    # a conversation the user is clearly resetting.
+    _cancel_bg_tasks(session)
     # Roll back any dangling user message added to history before the abort
     history = session["history"]
     if history and history[-1].get("role") == "user":
         history.pop()
     await update.message.reply_text(
-        "🛑 *Restart requested.*\n\n"
-        "Any pending AI request has been signalled to stop. "
-        "You can send a new message now.",
+        "🛑 *Restart requested.* You can send a new message now.",
         parse_mode="Markdown",
     )
 
@@ -2113,8 +2485,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 search_msgs.append(
                     {"role": "user", "content": user_message + "\n\n" + ctx}
                 )
+                # System prompt = base-with-results + rolling memory
                 search_msgs.insert(
-                    0, {"role": "system", "content": SYSTEM_PROMPT_WITH_RESULTS}
+                    0,
+                    {
+                        "role": "system",
+                        "content": _build_system_prompt(
+                            session, SYSTEM_PROMPT_WITH_RESULTS
+                        ),
+                    },
                 )
 
                 if cancel_event.is_set():
@@ -2134,9 +2513,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(
                     "[Bot] Search returned no results — falling back to direct AI"
                 )
+                fallback_msgs = [
+                    {"role": "system", "content": _build_system_prompt(session)}
+                ] + session["history"]
                 bot_response = await _chat_with_retry(
                     provider,
-                    messages=session["history"],
+                    messages=fallback_msgs,
                     model=current_model,
                     enable_thinking=thinking_enabled,
                     cancel_event=cancel_event,
@@ -2150,13 +2532,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(
                     f"[Bot] user={user_id} provider={provider_name} → quick-filter skip, direct AI call"
                 )
+            chat_msgs = [
+                {"role": "system", "content": _build_system_prompt(session)}
+            ] + session["history"]
             bot_response = await _chat_with_retry(
                 provider,
-                messages=session["history"],
+                messages=chat_msgs,
                 model=current_model,
                 enable_thinking=thinking_enabled,
                 cancel_event=cancel_event,
             )
+
+        # ── /restart race guard ────────────────────────────────────────────
+        # _chat_with_retry may have returned successfully while /restart
+        # fired in parallel and already popped our user message. If we
+        # appended the assistant now, we'd strand it without its user.
+        if cancel_event.is_set():
+            raise asyncio.CancelledError("Cancelled by /restart")
 
         # ── Fallback for empty response ────────────────────────────────────
         if not bot_response.strip():
@@ -2165,7 +2557,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ── Update history ─────────────────────────────────────────────────
         session["history"].append({"role": "assistant", "content": bot_response})
         assistant_appended = True
-        _trim_history(session["history"])
 
         # ── Send response (handle 4096 char limit) ─────────────────────────
         if len(bot_response) <= MAX_MESSAGE_LENGTH:
@@ -2195,6 +2586,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, chunk in enumerate(chunks, 1):
                 header = f"📄 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
                 await reply_text_safe(update.message, header + chunk)
+
+        # ── Rolling-memory compaction (fire-and-forget background task so
+        # the user never sees latency or any UI indication). Per-session
+        # lock inside the task serialises concurrent compactions.
+        _schedule_compact(session, provider, current_model)
 
     except asyncio.CancelledError:
         # /restart was issued — clean up history silently (restart_command already
@@ -2453,12 +2849,18 @@ async def _flush_media_group(group_id: str, context):
         {"role": "user", "content": f"[{total} image(s)] {prompt}"}
     )
     session["history"].append({"role": "assistant", "content": combined})
-    _trim_history(session["history"])
 
     try:
         await _send_ocr_reply(message, combined)
     except Exception as e:
         logger.error(f"[OCR] Failed to send album reply: {e}", exc_info=True)
+
+    try:
+        provider_name, provider = _resolve_provider(session)
+        current_model = session["models"].get(provider_name)
+        _schedule_compact(session, provider, current_model)
+    except Exception as e:
+        logger.warning(f"[OCR] post-album compact skipped: {e}")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2528,9 +2930,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         session["history"].append({"role": "user", "content": f"[image] {prompt}"})
         session["history"].append({"role": "assistant", "content": result})
-        _trim_history(session["history"])
 
         await _send_ocr_reply(update.message, result)
+
+        try:
+            provider_name, provider = _resolve_provider(session)
+            current_model = session["models"].get(provider_name)
+            _schedule_compact(session, provider, current_model)
+        except Exception as e:
+            logger.warning(f"[OCR] post-photo compact skipped: {e}")
 
     except Exception as e:
         logger.error(f"[OCR] Error for user={user_id}: {e}", exc_info=True)
@@ -2576,6 +2984,7 @@ def main():
     application.add_handler(CommandHandler("clearvalidation", clearvalidation_command))
     application.add_handler(CommandHandler("thinking", thinking_command))
     application.add_handler(CommandHandler("web", web_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(
