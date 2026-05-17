@@ -177,24 +177,26 @@ MAX_HISTORY_MESSAGES=20
 
 ### Image OCR
 
-OCR requires at least one API key (`NVIDIA_API_KEY` **or** `OCR_API_KEY`). All processing is fully in-memory — no files are written to disk.
+OCR requires at least one API key (`GEMINI_API_KEY`, `NVIDIA_API_KEY`, **or** `OCR_API_KEY`). All processing is fully in-memory — no files are written to disk.
+
+The default setup now uses **Gemini Flash Lite** via Google's OpenAI-compatible endpoint — no extra config needed if `GEMINI_API_KEY` is already set.
 
 ```env
-# Dedicated API key for OCR calls (optional if NVIDIA_API_KEY is already set)
+# Dedicated API key for OCR calls (optional if GEMINI_API_KEY or NVIDIA_API_KEY is already set)
 # Set this to use a different provider's key for vision without touching your chat provider keys
-# Priority: OCR_API_KEY → NVIDIA_API_KEY (fallback)
+# Priority: OCR_API_KEY → GEMINI_API_KEY → NVIDIA_API_KEY (fallback)
 OCR_API_KEY=your_ocr_provider_api_key
 
-# Vision model used for OCR (default: google/gemma-3-27b-it)
-# Other options: meta/llama-3.2-11b-vision-instruct
+# Vision model used for OCR (default: gemini-flash-lite-latest)
+# Gemini options: gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro
+# NVIDIA options: google/gemma-3-27b-it, meta/llama-3.2-11b-vision-instruct
 #                meta/llama-3.2-90b-vision-instruct
-#                microsoft/phi-3.5-vision-instruct
-OCR_VISION_MODEL=google/gemma-3-27b-it
+OCR_VISION_MODEL=gemini-flash-lite-latest
 
-# Base URL of the vision API endpoint (default: NVIDIA NIM)
+# Base URL of the vision API endpoint (default: Google Gemini OpenAI-compatible endpoint)
 # Override to point at any OpenAI-compatible vision endpoint
 # /chat/completions is appended automatically
-VISION_BASE_URL=https://integrate.api.nvidia.com/v1
+VISION_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 
 # Maximum image size accepted (default: 15728640 = 15 MB)
 MAX_IMAGE_BYTES=15728640
@@ -464,9 +466,9 @@ Bot: The universe began ~13.8 billion years ago with the Big Bang and has been e
 |----------|-------------|----------|-------|------------------|
 | **Groq** | 14,400 | Real-time chat | ⚡⚡⚡⚡⚡ | — |
 | **Cerebras** | Free tier | Fast inference | ⚡⚡⚡⚡⚡ | — |
-| **NVIDIA** | Free tier | Thinking + vision | ⚡⚡⚡⚡ | 💭 Reasoning mode, 🖼️ Image OCR |
+| **NVIDIA** | Free tier | Thinking + vision | ⚡⚡⚡⚡ | 💭 Reasoning mode, 🖼️ Image OCR (optional) |
 | **Vercel** | Free tier + $5 credits/month | Perplexity Sonar via AI Gateway | ⚡⚡⚡ | Preconfigured OpenAI-compatible endpoint |
-| **Gemini** | 100–1,000 | Quality responses | ⚡⚡⚡ | — |
+| **Gemini** | 100–1,000 | Quality responses | ⚡⚡⚡ | 🖼️ Default OCR provider |
 | **OpenRouter** | 50–1,000 | Model variety | ⚡⚡ | — |
 | **Custom** | Depends on provider | Self-hosted / private models | Varies | Any OpenAI-compatible endpoint |
 
@@ -477,20 +479,20 @@ Bot: The universe began ~13.8 billion years ago with the Big Bang and has been e
 1. **You send a photo** (with or without a caption)
 2. **Bot downloads it to RAM** — no files written to disk, ever
 3. **Raw bytes are base64-encoded** then the raw buffer is freed immediately
-4. **NVIDIA vision API is called** with the encoded image and your prompt (or the default OCR prompt)
+4. **Vision API is called** with the encoded image and your prompt (or the default OCR prompt) — defaults to Gemini Flash Lite via Google's OpenAI-compatible endpoint
 5. **Response is streamed back**, parsed, and sent as a Telegram message
 6. **Base64 string is deleted** and `gc.collect()` is called — memory fully reclaimed
 7. **OCR result is stored in conversation history as plain text** — you can ask follow-up questions about the content in the same chat without re-uploading
 
 For **multi-photo uploads** (albums): Telegram sends each photo as a separate event. The bot collects them for 1.5 seconds, then processes them one at a time (only one image in memory at a time) and sends a single combined reply.
 
-The OCR pipeline is fully customizable — all vars are optional and default to NVIDIA's free tier:
+The OCR pipeline is fully customizable — all vars are optional and default to **Gemini Flash Lite**:
 
 | Env Var | Default | Purpose |
-|---------|---------|---------|
-| `OCR_API_KEY` | falls back to `NVIDIA_API_KEY` | API key for the vision endpoint |
-| `OCR_VISION_MODEL` | `google/gemma-3-27b-it` | Vision model used for OCR |
-| `VISION_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Any OpenAI-compatible vision endpoint |
+|---------|---------|----------|
+| `OCR_API_KEY` | falls back to `GEMINI_API_KEY` → `NVIDIA_API_KEY` | API key for the vision endpoint |
+| `OCR_VISION_MODEL` | `gemini-flash-lite-latest` | Vision model used for OCR |
+| `VISION_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` | Any OpenAI-compatible vision endpoint |
 | `MAX_IMAGE_BYTES` | `15728640` (15 MB) | Max accepted image size |
 
 To use a completely different provider for OCR (e.g. OpenRouter, Together AI, self-hosted), set all three — `OCR_API_KEY`, `OCR_VISION_MODEL`, and `VISION_BASE_URL` — without touching your chat provider keys.
@@ -592,10 +594,11 @@ You don't need to set any env vars for this feature. If you want to tune it, see
 - Run `/clearvalidation` then `/validate` to start fresh
 
 ### Image OCR not working
-- OCR requires `NVIDIA_API_KEY` **or** `OCR_API_KEY` — at least one must be set
-- `OCR_API_KEY` takes priority over `NVIDIA_API_KEY` when both are set
-- Check that `OCR_VISION_MODEL` is a vision-capable model (default `google/gemma-3-27b-it` supports vision)
-- If you get empty responses, try a different model: `OCR_VISION_MODEL=meta/llama-3.2-11b-vision-instruct`
+- OCR requires `GEMINI_API_KEY`, `NVIDIA_API_KEY`, **or** `OCR_API_KEY` — at least one must be set
+- Key priority: `OCR_API_KEY` → `GEMINI_API_KEY` → `NVIDIA_API_KEY`
+- Default model is `gemini-flash-lite-latest` via Google's OpenAI-compatible endpoint — works automatically if `GEMINI_API_KEY` is set
+- To switch back to NVIDIA: set `OCR_VISION_MODEL=google/gemma-3-27b-it` and `VISION_BASE_URL=https://integrate.api.nvidia.com/v1`
+- If you get empty responses, try a different model: `OCR_VISION_MODEL=gemini-2.0-flash` or `OCR_VISION_MODEL=meta/llama-3.2-11b-vision-instruct`
 - To use a fully custom provider: set `OCR_API_KEY`, `OCR_VISION_MODEL`, and `VISION_BASE_URL` together
 - For rate limit errors the bot retries automatically (up to 2 retries with backoff)
 

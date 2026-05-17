@@ -57,9 +57,7 @@ except ValueError:
 # decisions, preferences and ongoing topics without paying for the full
 # raw transcript every turn.
 try:
-    COMPACT_THRESHOLD = int(
-        os.getenv("COMPACT_THRESHOLD", str(MAX_HISTORY_MESSAGES))
-    )
+    COMPACT_THRESHOLD = int(os.getenv("COMPACT_THRESHOLD", str(MAX_HISTORY_MESSAGES)))
 except ValueError:
     COMPACT_THRESHOLD = MAX_HISTORY_MESSAGES
 try:
@@ -115,12 +113,12 @@ CUSTOM_BASE_URL = os.getenv("CUSTOM_BASE_URL", "").rstrip("/")
 CUSTOM_DEFAULT_MODEL = os.getenv("CUSTOM_DEFAULT_MODEL", "")
 
 # Vision / OCR Configuration
-NVIDIA_VISION_MODEL = os.getenv("OCR_VISION_MODEL", "google/gemma-3-27b-it")
+NVIDIA_VISION_MODEL = os.getenv("OCR_VISION_MODEL", "gemini-flash-lite-latest")
 VISION_BASE_URL = os.getenv(
-    "VISION_BASE_URL", "https://integrate.api.nvidia.com/v1"
+    "VISION_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
 ).rstrip("/")
-# OCR_API_KEY takes priority; falls back to NVIDIA_API_KEY so existing setups need no change
-OCR_API_KEY = os.getenv("OCR_API_KEY") or NVIDIA_API_KEY
+# OCR_API_KEY takes priority; falls back to GEMINI_API_KEY, then NVIDIA_API_KEY
+OCR_API_KEY = os.getenv("OCR_API_KEY") or GEMINI_API_KEY or NVIDIA_API_KEY
 try:
     MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(15 * 1024 * 1024)))  # 15 MB
 except ValueError:
@@ -691,7 +689,9 @@ async def _compact_history(
             )
             return False
 
-        new_summary = strip_thinking_tags(new_summary or "", keep_thinking=False).strip()
+        new_summary = strip_thinking_tags(
+            new_summary or "", keep_thinking=False
+        ).strip()
         if not new_summary:
             logger.warning(
                 "[Compact] Empty summary returned. Falling back to hard trim."
@@ -700,9 +700,7 @@ async def _compact_history(
             return False
 
         if len(new_summary) > MAX_SUMMARY_CHARS:
-            new_summary = (
-                new_summary[:MAX_SUMMARY_CHARS].rstrip() + "\n…[truncated]"
-            )
+            new_summary = new_summary[:MAX_SUMMARY_CHARS].rstrip() + "\n…[truncated]"
 
         # In-place delete preserves any messages the user appended during
         # our await window — fixes the silent-message-loss bug where
@@ -1036,7 +1034,7 @@ class GeminiProvider(AIProvider):
 
         genai.configure(api_key=api_key)
         self.genai = genai
-        self.default_model = "gemini-1.5-flash"
+        self.default_model = "gemini-flash-lite-latest"
 
     def chat(
         self,
@@ -1099,10 +1097,11 @@ class GeminiProvider(AIProvider):
 
     def _get_fallback_models(self) -> List[Dict[str, str]]:
         return [
+            {"id": "gemini-flash-lite-latest", "name": "Gemini Flash Lite (Latest)"},
+            {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash"},
             {"id": "gemini-1.5-flash", "name": "Gemini 1.5 Flash"},
             {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro"},
             {"id": "gemini-2.0-flash-exp", "name": "Gemini 2.0 Flash Experimental"},
-            {"id": "gemini-1.5-flash-8b", "name": "Gemini 1.5 Flash 8B"},
         ]
 
     def get_name(self) -> str:
@@ -2322,9 +2321,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     web_on = session.get("web_search", True)
     engine = session.get("search_engine", "duckduckgo")
-    engine_label = {"brave": "Brave", "searxng": "SearXNG", "duckduckgo": "DuckDuckGo"}.get(
-        engine, engine
-    )
+    engine_label = {
+        "brave": "Brave",
+        "searxng": "SearXNG",
+        "duckduckgo": "DuckDuckGo",
+    }.get(engine, engine)
     web_line = f"ON ({engine_label})" if web_on else "OFF"
 
     thinking_on = session.get("thinking_enabled", False)
@@ -2873,7 +2874,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not OCR_API_KEY:
         await update.message.reply_text(
-            "❌ Image OCR requires `NVIDIA_API_KEY` or `OCR_API_KEY` to be configured.",
+            "❌ Image OCR requires `GEMINI_API_KEY`, `NVIDIA_API_KEY`, or `OCR_API_KEY` to be configured.",
             parse_mode="Markdown",
         )
         return
@@ -2945,7 +2946,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.reply_text(
                 f"❌ Failed to process image: {str(e)}\n\n"
-                f"Make sure `NVIDIA_API_KEY` is valid and model `{NVIDIA_VISION_MODEL}` is accessible."
+                f"Make sure `OCR_API_KEY` (or `GEMINI_API_KEY`) is valid and model `{NVIDIA_VISION_MODEL}` is accessible."
             )
         except Exception:
             pass
@@ -2999,7 +3000,7 @@ def main():
         )
     else:
         logger.info(
-            "🖼️  Image OCR disabled — set NVIDIA_API_KEY or OCR_API_KEY to enable"
+            "🖼️  Image OCR disabled — set GEMINI_API_KEY, NVIDIA_API_KEY, or OCR_API_KEY to enable"
         )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
