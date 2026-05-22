@@ -111,6 +111,7 @@ VERCEL_API_KEY = os.getenv("VERCEL_API_KEY")
 CUSTOM_API_KEY = os.getenv("CUSTOM_API_KEY", "")
 CUSTOM_BASE_URL = os.getenv("CUSTOM_BASE_URL", "").rstrip("/")
 CUSTOM_DEFAULT_MODEL = os.getenv("CUSTOM_DEFAULT_MODEL", "")
+OPENAI_SDK_USER_AGENT = os.getenv("OPENAI_SDK_USER_AGENT", "curl/8.7.1")
 
 # Vision / OCR Configuration
 NVIDIA_VISION_MODEL = os.getenv("OCR_VISION_MODEL", "gemini-flash-lite-latest")
@@ -1121,7 +1122,12 @@ class OpenRouterProvider(AIProvider):
         super().__init__()
         from openai import OpenAI
 
-        self.client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        client_kwargs = {}
+        if OPENAI_SDK_USER_AGENT:
+            client_kwargs["default_headers"] = {"User-Agent": OPENAI_SDK_USER_AGENT}
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1", api_key=api_key, **client_kwargs
+        )
         self.api_key = api_key
         self.default_model = "openrouter/free"
 
@@ -1301,8 +1307,13 @@ class NvidiaProvider(AIProvider):
         super().__init__()
         from openai import OpenAI
 
+        client_kwargs = {}
+        if OPENAI_SDK_USER_AGENT:
+            client_kwargs["default_headers"] = {"User-Agent": OPENAI_SDK_USER_AGENT}
         self.client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1", api_key=api_key
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=api_key,
+            **client_kwargs,
         )
         self.default_model = "nvidia/nemotron-3-super-120b-a12b"
 
@@ -1415,7 +1426,11 @@ class CustomProvider(AIProvider):
         super().__init__()
         from openai import OpenAI
 
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        user_agent = OPENAI_SDK_USER_AGENT
+        client_kwargs = {}
+        if user_agent:
+            client_kwargs["default_headers"] = {"User-Agent": user_agent}
+        self.client = OpenAI(base_url=base_url, api_key=api_key, **client_kwargs)
         self.api_key = api_key
         self.base_url = base_url
         self.default_model = default_model

@@ -152,6 +152,22 @@ CUSTOM_DEFAULT_MODEL=your-model-id
 > If the endpoint doesn't expose that route it silently falls back to `CUSTOM_DEFAULT_MODEL` only.
 > Use `/provider custom` to switch to it and `/models all` to see discovered models.
 
+### OpenAI SDK User-Agent (OpenRouter, NVIDIA, Vercel, Custom)
+
+These providers use the OpenAI Python SDK internally. By default, the bot sends:
+
+```env
+OPENAI_SDK_USER_AGENT=curl/8.7.1
+```
+
+You can override it if needed:
+
+```env
+OPENAI_SDK_USER_AGENT=your-custom-user-agent
+```
+
+Set it to an empty value to disable explicit User-Agent override and let the SDK default apply.
+
 ### Access Control
 
 ```env
@@ -575,6 +591,7 @@ You don't need to set any env vars for this feature. If you want to tune it, see
 - Switch provider: `/provider <name>`
 - Check rate limits — try again in a few minutes
 - Run `/validate` to find working models
+- For OpenAI-compatible endpoints returning `Your request was blocked`, try setting `OPENAI_SDK_USER_AGENT` explicitly (default is `curl/8.7.1`)
 
 ### Bot takes too long to respond / feels stuck
 - Free-tier LLM endpoints can queue for 5–30 minutes under heavy load
