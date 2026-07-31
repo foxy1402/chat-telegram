@@ -47,15 +47,16 @@ try:
     MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))  # must be even
 except ValueError:
     MAX_HISTORY_MESSAGES = 20
+if MAX_HISTORY_MESSAGES % 2:
+    MAX_HISTORY_MESSAGES += 1
+    logger.warning(
+        f"MAX_HISTORY_MESSAGES must be even — adjusted to {MAX_HISTORY_MESSAGES}"
+    )
+if MAX_HISTORY_MESSAGES < 2:
+    MAX_HISTORY_MESSAGES = 2
+    logger.warning("MAX_HISTORY_MESSAGES must be >= 2 — adjusted to 2")
 
 # ── SMART COMPACTION (Claude-style rolling memory) ─────────────────────────
-# When history grows past COMPACT_THRESHOLD, the older portion is rolled into
-# a structured summary stored in session["summary"]. The newest
-# COMPACT_KEEP_RECENT messages are always kept verbatim for high-fidelity
-# recent context. The summary is appended to the system prompt on every
-# subsequent chat call, so the bot keeps a long-term memory of facts,
-# decisions, preferences and ongoing topics without paying for the full
-# raw transcript every turn.
 try:
     COMPACT_THRESHOLD = int(os.getenv("COMPACT_THRESHOLD", str(MAX_HISTORY_MESSAGES)))
 except ValueError:
@@ -64,7 +65,6 @@ try:
     COMPACT_KEEP_RECENT = int(os.getenv("COMPACT_KEEP_RECENT", "8"))
 except ValueError:
     COMPACT_KEEP_RECENT = 8
-# Must keep at least one pair and stay on a pair boundary (even number)
 if COMPACT_KEEP_RECENT < 2:
     COMPACT_KEEP_RECENT = 2
 if COMPACT_KEEP_RECENT % 2:
@@ -77,18 +77,14 @@ try:
     COMPACT_MAX_TOKENS = int(os.getenv("COMPACT_MAX_TOKENS", "1500"))
 except ValueError:
     COMPACT_MAX_TOKENS = 1500
-COMPACT_TIMEOUT = 60.0  # seconds — one-shot timeout for the summarizer call
+COMPACT_TIMEOUT = 60.0
 
 MAX_MESSAGE_LENGTH = 4096
-MAX_INPUT_LENGTH = (
-    4000  # Reject user messages above this to protect memory and API costs
-)
+MAX_INPUT_LENGTH = 4000
 
 # Web Search Configuration
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
-SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip(
-    "/"
-)  # e.g. http://searxng.example.com
+SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "brave").lower()
 try:
     MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
@@ -118,10 +114,20 @@ NVIDIA_VISION_MODEL = os.getenv("OCR_VISION_MODEL", "gemini-flash-lite-latest")
 VISION_BASE_URL = os.getenv(
     "VISION_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
 ).rstrip("/")
-# OCR_API_KEY takes priority; falls back to GEMINI_API_KEY, then NVIDIA_API_KEY
 OCR_API_KEY = os.getenv("OCR_API_KEY") or GEMINI_API_KEY or NVIDIA_API_KEY
+if (
+    not os.getenv("OCR_API_KEY")
+    and not GEMINI_API_KEY
+    and NVIDIA_API_KEY
+    and "generativelanguage.googleapis.com" in VISION_BASE_URL
+):
+    logger.warning(
+        "⚠️ Only NVIDIA_API_KEY is set, but VISION_BASE_URL points at the Gemini "
+        "endpoint — the NVIDIA key will likely be rejected there. "
+        "Set OCR_API_KEY to a Gemini key, GEMINI_API_KEY, or an NVIDIA-compatible VISION_BASE_URL."
+    )
 try:
-    MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(15 * 1024 * 1024)))  # 15 MB
+    MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(15 * 1024 * 1024)))
 except ValueError:
     MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
@@ -132,12 +138,6 @@ VALIDATED_MODELS_CACHE = os.path.join(
 
 # ============================================================================
 # SYSTEM PROMPTS
-#
-# SYSTEM_PROMPT              — all direct AI calls (no search)
-# SYSTEM_PROMPT_WITH_RESULTS — when search results are injected into context
-# _make_search_decision_prompt() — standalone router prompt, built per-request
-#                                  with today's date; used only for the
-#                                  lightweight SEARCH/NOSEARCH decision call
 # ============================================================================
 
 _PROMPT_BASE = (
@@ -150,50 +150,28 @@ _PROMPT_BASE = (
     "- Keep responses concise. Avoid long preambles and sign-offs\n"
     "- For comparisons: use *bold item name* on its own line, then bullet points for attributes. "
     "Never use | pipe | tables — they do not render in Telegram\n\n"
-    "BEHAVIOUR:\n"
-    "- Be direct and practical\n"
-    "- If you don't know something, say so rather than guessing\n"
-    "- When code is requested, use fenced code blocks with the language name"
+    "BEHAVIOUR (in priority order — earlier wins over later):\n"
+    "1. If you're not sure, say so explicitly and early. Never state uncertainty "
+    "as if it were fact. It is ALWAYS better to say 'I don't know' or "
+    "'I'm not certain, but...' than to state something wrong with confidence. "
+    "This is the single most important rule.\n"
+    "2. Be direct and practical\n"
+    "3. When code is requested, use fenced code blocks with the language name\n\n"
+    "WEB SEARCH TOOL:\n"
+    "You have access to a `web_search` tool. Call it automatically whenever the user's "
+    "question requires current, real-time, or time-sensitive information such as: "
+    "news, prices, sports scores, weather, product availability, recent events, "
+    "people's current status, or any fact you are not fully confident about. "
+    "Do NOT call the tool for: coding help, math, creative writing, definitions, "
+    "greetings, opinions, or general knowledge you can answer confidently. "
+    "When search results are provided to you, base your answer ONLY on those results. "
+    "Do NOT use your training data to fill in facts absent from the results — "
+    "if the results lack enough info, say so clearly. "
+    "If the search returns no usable results at all, say plainly 'I couldn't find "
+    "current information on that' and stop — do not fall back to memory. "
+    "Today's date is {date}."
 )
 
-_PROMPT_SEARCH_DECISION = (
-    "You are a search router. Decide if the user's latest message needs a "
-    "live web search to answer accurately. Today's date is {date}.\n\n"
-    "Respond with EXACTLY one line:\n"
-    "  SEARCH: <query>   — needs current/real-time info\n"
-    "  NOSEARCH           — can answer from training knowledge\n\n"
-    "Query rules: be specific. Include the exact subject noun (product name, person, topic). "
-    "For time-sensitive questions add the current year. Aim for 4-8 words. "
-    "Never truncate mid-phrase — the query must be self-contained and searchable.\n\n"
-    "Use SEARCH for: current events, live prices, weather, sports scores, "
-    "recent news, product availability, real-time data, people's current status, "
-    "or any fact you are NOT fully confident about.\n\n"
-    "Use NOSEARCH for: coding help, math, creative writing, definitions, "
-    "explanations, greetings, opinions, general knowledge, or anything "
-    "you can confidently answer from training data.\n\n"
-    "CRITICAL: Output ONLY one line. No explanations. No apologies. "
-    "No extra text after SEARCH: query. Just the decision."
-)
-
-_PROMPT_SEARCH_RESULTS = (
-    "\n\nSEARCH RESULTS FORMAT:\n"
-    "When web search results are provided, they appear as numbered snippets "
-    "(1. Title: text). Base your answer ONLY on information contained in these snippets. "
-    "Do NOT use your training data to fill in facts that are absent from the snippets — "
-    "if the snippets do not contain enough information to answer confidently, "
-    "say so clearly (e.g. 'The search results don't specify this — please check a dedicated source'). "
-    "You may refer to a result naturally (e.g. 'according to Tom's Hardware') but do NOT "
-    "write citation numbers like [1] or [2] — there is no reference list."
-)
-
-# Pre-built at startup — never re-allocated per request
-SYSTEM_PROMPT = _PROMPT_BASE
-SYSTEM_PROMPT_WITH_RESULTS = _PROMPT_BASE + _PROMPT_SEARCH_RESULTS
-
-# ── COMPACTION SUMMARIZER PROMPT ───────────────────────────────────────────
-# Folds older messages into a structured "rolling memory" document.
-# Designed to be FED ITSELF on next compaction (rolling / incremental
-# summarisation) — same pattern Claude uses for /compact.
 _PROMPT_COMPACT_SUMMARIZER = (
     "You are a conversation memory compactor. Your job is to produce a "
     "dense, structured rolling memory of an ongoing chat so the assistant "
@@ -227,40 +205,18 @@ _PROMPT_COMPACT_SUMMARIZER = (
     "- Output ONLY the memory document. No 'Here is the summary' wrapper, no markdown fences."
 )
 
-
-def _make_search_decision_prompt() -> str:
-    """Build the standalone search-router prompt with today's date injected."""
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    return _PROMPT_SEARCH_DECISION.format(date=today)
+# Pre-built at startup
+SYSTEM_PROMPT = _PROMPT_BASE  # date injected per-request via _build_system_prompt()
 
 
 def _make_compact_summarizer_prompt() -> str:
-    """Build the rolling-memory summarizer prompt with the char cap injected."""
     return _PROMPT_COMPACT_SUMMARIZER.format(max_chars=MAX_SUMMARY_CHARS)
 
 
-def _serialize_history_for_summary(messages: List[Dict]) -> str:
-    """Render a list of {role, content} messages as plain transcript for the summarizer."""
-    role_label = {"user": "USER", "assistant": "ASSISTANT", "system": "SYSTEM"}
-    lines = []
-    for msg in messages:
-        content = (msg.get("content") or "").strip()
-        if not content:
-            continue
-        label = role_label.get(msg.get("role", "?"), msg.get("role", "?").upper())
-        lines.append(f"{label}: {content}")
-    return "\n\n".join(lines)
-
-
-def _build_system_prompt(session: Dict, base: str = None) -> str:
-    """Return the system prompt with the rolling memory appended (if any).
-
-    Called once per chat request to produce the system message that gets
-    prepended to messages going to the LLM. The summary is treated as
-    authoritative background knowledge about this user and chat history.
-    """
-    if base is None:
-        base = SYSTEM_PROMPT
+def _build_system_prompt(session: Dict) -> str:
+    """Return the system prompt with today's date and rolling memory appended (if any)."""
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    base = _PROMPT_BASE.format(date=today)
     summary = (session.get("summary") or "").strip()
     if not summary:
         return base
@@ -272,193 +228,53 @@ def _build_system_prompt(session: Dict, base: str = None) -> str:
     )
 
 
+def _serialize_history_for_summary(messages: List[Dict]) -> str:
+    role_label = {"user": "USER", "assistant": "ASSISTANT", "system": "SYSTEM"}
+    lines = []
+    for msg in messages:
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        label = role_label.get(msg.get("role", "?"), msg.get("role", "?").upper())
+        lines.append(f"{label}: {content}")
+    return "\n\n".join(lines)
+
+
 # ============================================================================
-# SEARCH DECISION — QUICK FILTER
+# FUNCTION CALLING — WEB SEARCH TOOL DEFINITION
 #
-# Greetings and very short messages skip the AI decision call entirely (1 call).
-# Everything else gets a lightweight AI call for SEARCH/NOSEARCH routing.
+# This single tool definition is passed to every provider that supports
+# OpenAI-compatible tool/function calling. The model decides autonomously
+# whether to call it; no separate SEARCH/NOSEARCH router call is needed.
 # ============================================================================
 
-_GREETINGS = frozenset(
-    {
-        "hi",
-        "hello",
-        "hey",
-        "hola",
-        "thanks",
-        "thank you",
-        "bye",
-        "goodbye",
-        "ok",
-        "okay",
-        "yes",
-        "no",
-        "sure",
-        "lol",
-        "haha",
-        "nice",
-        "great",
-        "cool",
-        "good morning",
-        "good night",
-        "good evening",
-        "good afternoon",
-        "ty",
-        "thx",
-        "np",
-        "yw",
-    }
-)
-
-
-def _skip_search_decision(text: str) -> bool:
-    """Return True for messages that obviously don't need a web search decision call."""
-    if len(text) < 6:
-        return True
-    return text.lower().rstrip("!?.,: ") in _GREETINGS
-
-
-def _parse_search_query(response: str) -> Optional[str]:
-    """Extract SEARCH: query from AI search-decision response.
-
-    Returns clean query string if AI wants to search, or None if it answered directly.
-
-    Strategy: after extracting the first line following 'SEARCH:', keep only the
-    leading portion that looks like a valid search query — alphanumeric, spaces,
-    and common query punctuation (hyphen, apostrophe, straight quotes, dots, /).
-    Anything else (*, apology text, leaked context, Markdown) is treated as a
-    natural end-of-query boundary and discarded.  This replaces the old brittle
-    _APOLOGY_PATTERNS list that had to be updated every time a new model quirk appeared.
-    """
-    stripped = response.strip()
-
-    if stripped.upper().startswith("SEARCH:"):
-        raw = stripped[7:].strip().split("\n")[0].strip()
-    else:
-        # Fallback: model added preamble before SEARCH: (e.g. "I'll look that up. SEARCH: query")
-        m = re.search(r"(?i)\bSEARCH:\s*(.+)", stripped)
-        if not m:
-            return None
-        raw = m.group(1).strip().split("\n")[0].strip()
-
-    # Truncate at NOSEARCH keyword if model appends it on the same line
-    # (e.g. Cerebras: "Taylor Swift latest song 2026NOSEARCHSEARCH")
-    # Also recover a new SEARCH: query that follows NOSEARCH inline
-    parts = re.split(r"(?i)NOSEARCH", raw, maxsplit=1)
-    if len(parts) == 2 and re.match(r"(?i)\s*SEARCH:\s*", parts[1]):
-        # Model wrote: "<junk>NOSEARCHSEARCH: real query" — use the part after NOSEARCH
-        raw = re.sub(r"(?i)^SEARCH:\s*", "", parts[1]).strip()
-    else:
-        raw = parts[0].strip()
-
-    # Strip repeated SEARCH: prefix (some models double/triple the entire output)
-    while raw.upper().startswith("SEARCH:"):
-        raw = raw[7:].strip()
-
-    # Truncate at any remaining inline SEARCH: (model echoed query without newline separator)
-    # e.g. "Taylor SwiftSEARCH: Taylor Swift" → "Taylor Swift"
-    m_echo = re.search(r"(?i)SEARCH:", raw)
-    if m_echo:
-        raw = raw[: m_echo.start()].strip()
-
-    # Strip surrounding quotes/backticks some models add
-    for q in ('"', "'", "`"):
-        if len(raw) > 2 and raw[0] == q and raw[-1] == q:
-            raw = raw[1:-1].strip()
-
-    # Normalize Unicode hyphens/dashes to ASCII hyphen so the regex below
-    # doesn't stop at typographic chars that models (e.g. gpt-oss-120b) emit.
-    raw = raw.replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
-
-    # Keep only the leading valid-query portion.
-    # Valid chars: letters, digits, spaces, - ' " . / & + % @ # ( )
-    # First char outside this set is treated as end-of-query.
-    m = re.match(r"^[\w\s\-'\".,/&+%@#()]+", raw, re.UNICODE)
-    raw = m.group(0).strip() if m else ""
-
-    # Cap at 12 words to prevent explanatory bleed-through
-    # (prompt requests 4-8 words; 12 gives headroom for longer self-contained queries)
-    words = raw.split()
-    if len(words) > 12:
-        raw = " ".join(words[:12])
-
-    raw = raw[:120]
-    return raw if len(raw) >= 2 else None
-
-
-def _build_search_context(query: str, snippets: list) -> str:
-    """Format search results as numbered snippets with today's date for temporal grounding."""
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    parts = [f"Today is {today}. Web search results for '{query}':"]
-    for i, snip in enumerate(snippets, 1):
-        parts.append(f"{i}. {snip}")
-    return "\n".join(parts)
-
-
-_SEARCH_DECISION_RETRIES = 3
-_SEARCH_DECISION_RETRY_DELAY = 2.0  # seconds between retries
-
-
-async def ai_decide_search(
-    provider, model: Optional[str], messages: list
-) -> Optional[str]:
-    """Lightweight AI call to decide SEARCH vs NOSEARCH.
-
-    Uses a standalone router system prompt (not the main assistant prompt).
-    Passes full conversation history so the AI has context for multi-turn exchanges.
-    Retries up to _SEARCH_DECISION_RETRIES times on empty/failed responses.
-
-    On total failure, optimistically searches using the raw user message rather than
-    silently falling back to NOSEARCH.
-    Returns a clean search query string, or None to answer directly.
-    """
-    decision_msgs = [{"role": "system", "content": _make_search_decision_prompt()}]
-    decision_msgs += [m for m in messages if m.get("role") != "system"]
-
-    last_error: Optional[Exception] = None
-    for attempt in range(1, _SEARCH_DECISION_RETRIES + 1):
-        try:
-            response = (
-                await asyncio.to_thread(
-                    provider.chat,
-                    messages=decision_msgs,
-                    model=model,
-                    enable_thinking=False,
-                    max_tokens=100,
-                )
-                or ""
-            )
-            if response.strip():
-                return _parse_search_query(response)
-            logger.warning(
-                f"[Bot] Search decision attempt {attempt}: empty response, retrying..."
-            )
-        except Exception as e:
-            last_error = e
-            logger.warning(
-                f"[Bot] Search decision attempt {attempt} error: {e}, retrying..."
-            )
-        if attempt < _SEARCH_DECISION_RETRIES:
-            await asyncio.sleep(_SEARCH_DECISION_RETRY_DELAY)
-
-    fallback_query = next(
-        (m["content"] for m in reversed(messages) if m.get("role") == "user"),
-        None,
-    )
-    if fallback_query:
-        fallback_query = fallback_query[:80].strip()
-        logger.warning(
-            f"[Bot] Search decision failed after {_SEARCH_DECISION_RETRIES} attempts "
-            f"({last_error or 'empty response'}) — optimistic fallback SEARCH: '{fallback_query}'"
-        )
-        return fallback_query
-
-    logger.warning(
-        f"[Bot] Search decision failed after {_SEARCH_DECISION_RETRIES} attempts "
-        f"({last_error or 'empty response'}) — no user message found, falling back to NOSEARCH"
-    )
-    return None
-
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the web for current, real-time, or time-sensitive information. "
+            "Call this when the user asks about recent news, live prices, sports scores, "
+            "weather, product availability, people's current status, recent events, "
+            "or any fact you are not fully confident about from training data. "
+            "Do NOT call for coding help, math, definitions, greetings, or stable general knowledge."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "A specific, self-contained web search query. "
+                        "Include the subject noun and, for time-sensitive topics, the current year. "
+                        "Aim for 4-8 words. Must be fully formed and searchable."
+                    ),
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 # ============================================================================
 # TRANSIENT API RETRY
@@ -481,12 +297,8 @@ _TRANSIENT_ERROR_KEYWORDS = (
     "connection reset",
 )
 _CHAT_MAX_RETRIES = 2
-_CHAT_RETRY_BASE_DELAY = 3.0  # seconds; doubles each attempt (3s, 6s)
-
-
-# Per-attempt timeout for LLM calls — prevents a single hung request from
-# blocking a retry indefinitely. Keep generous enough for slow endpoints.
-_CHAT_ATTEMPT_TIMEOUT = 120.0  # seconds per individual provider.chat() call
+_CHAT_RETRY_BASE_DELAY = 3.0
+_CHAT_ATTEMPT_TIMEOUT = 120.0
 
 
 async def _chat_with_retry(
@@ -494,17 +306,16 @@ async def _chat_with_retry(
     messages: list,
     model: Optional[str],
     enable_thinking: bool,
+    tools: Optional[list] = None,
     cancel_event: Optional["asyncio.Event"] = None,
-) -> str:
+) -> any:
     """Call provider.chat() with automatic retry on transient errors.
 
-    Retries up to _CHAT_MAX_RETRIES times with exponential backoff.
-    Non-transient errors (bad model, auth failures, etc.) raise immediately.
-    Each attempt is wrapped in asyncio.wait_for(_CHAT_ATTEMPT_TIMEOUT) so a
-    totally unresponsive endpoint doesn't hold a retry slot forever.
-    If *cancel_event* is set (e.g. the user issued /restart) the call raises
-    asyncio.CancelledError immediately — even during a retry sleep.
+    When tools is provided and the provider supports function calling,
+    returns a ChatResult namedtuple with (.content, .tool_calls).
+    Otherwise returns a plain string (backward compat for compaction calls).
     """
+    e_for_delay: Optional[BaseException] = None
     for attempt in range(1, _CHAT_MAX_RETRIES + 2):
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError("Cancelled by /restart")
@@ -515,10 +326,11 @@ async def _chat_with_retry(
                     messages=messages,
                     model=model,
                     enable_thinking=enable_thinking,
+                    tools=tools,
                 ),
                 timeout=_CHAT_ATTEMPT_TIMEOUT,
             )
-            return result or ""
+            return result if result is not None else ""
         except asyncio.TimeoutError:
             if attempt > _CHAT_MAX_RETRIES:
                 raise
@@ -534,27 +346,25 @@ async def _chat_with_retry(
                 raise
             error_lower = str(e).lower()
             if not any(kw in error_lower for kw in _TRANSIENT_ERROR_KEYWORDS):
-                raise  # Permanent error — don't retry
+                raise
             e_for_delay = e
         else:
-            break  # success path is handled by return above
+            break
 
         delay = _CHAT_RETRY_BASE_DELAY * (2 ** (attempt - 1))
         logger.warning(
             f"[Bot] Transient API error (attempt {attempt}/{_CHAT_MAX_RETRIES + 1}): "
             f"{e_for_delay} — retrying in {delay:.0f}s"
         )
-        # Interruptible sleep — /restart wakes us immediately
         if cancel_event:
             try:
                 await asyncio.wait_for(cancel_event.wait(), timeout=delay)
-                # Event was set — user cancelled
                 raise asyncio.CancelledError("Cancelled by /restart")
             except asyncio.TimeoutError:
-                pass  # Normal: delay elapsed, proceed to next attempt
+                pass
         else:
             await asyncio.sleep(delay)
-    return ""  # unreachable, satisfies type checker
+    return ""
 
 
 # ============================================================================
@@ -563,16 +373,10 @@ async def _chat_with_retry(
 
 
 def _trim_history(history: list) -> list:
-    """Hard-cap fallback: trim history to MAX_HISTORY_MESSAGES keeping complete
-    user/assistant pairs. Used as a safety net when compaction is unavailable
-    or fails — the rolling-summary path (_compact_history) is the primary
-    mechanism for context management.
-    """
     if len(history) <= MAX_HISTORY_MESSAGES:
         return history
-
     excess = len(history) - MAX_HISTORY_MESSAGES
-    pairs_to_remove = (excess + 1) // 2  # Round up to preserve pairs
+    pairs_to_remove = (excess + 1) // 2
     messages_to_remove = pairs_to_remove * 2
     del history[:messages_to_remove]
     return history
@@ -585,45 +389,20 @@ async def _compact_history(
     *,
     force: bool = False,
 ) -> bool:
-    """Roll older messages into session['summary'] and truncate history.
-
-    This is the Claude-style /compact equivalent: instead of dropping old
-    messages, we ask the LLM to fold them into a structured rolling memory
-    that lives in the system prompt on every subsequent call.
-
-    Semantics:
-    - History is split at a user/assistant pair boundary so we never strand
-      a dangling half-exchange.
-    - The last COMPACT_KEEP_RECENT messages remain verbatim (high-fidelity
-      recent context).
-    - Everything older is sent to the summarizer ALONG WITH the previous
-      rolling memory so summarisation is incremental — old facts persist
-      across many compactions.
-    - Compaction holds a per-session asyncio.Lock so two near-simultaneous
-      messages can't double-compact.
-    - On any failure we fall back to _trim_history so memory stays bounded.
-
-    Returns True if a compaction was performed, False otherwise.
-    """
     lock: Optional[asyncio.Lock] = session.get("compact_lock")
     if lock is None:
         lock = asyncio.Lock()
         session["compact_lock"] = lock
 
     async with lock:
-        # Capture the live list reference. After the await we'll verify it
-        # hasn't been swapped out from under us by /clear or /provider.
         original_history = session["history"]
         history = original_history
 
         if not force and len(history) <= COMPACT_THRESHOLD:
             return False
-
-        # Need at least one full pair to compact beyond the keep-recent tier
         if len(history) < COMPACT_KEEP_RECENT + 2:
             return False
 
-        # Split on a pair boundary so the kept tail starts with a USER turn
         split_at = len(history) - COMPACT_KEEP_RECENT
         if split_at % 2:
             split_at -= 1
@@ -656,34 +435,31 @@ async def _compact_history(
         )
 
         try:
-            new_summary = await asyncio.wait_for(
+            # Compaction calls always use plain text — no tools
+            raw = await asyncio.wait_for(
                 asyncio.to_thread(
                     provider.chat,
                     messages=summary_msgs,
                     model=model,
                     enable_thinking=False,
+                    tools=None,
                     max_tokens=COMPACT_MAX_TOKENS,
                 ),
                 timeout=COMPACT_TIMEOUT,
             )
+            # provider.chat may return a ChatResult or a plain string here
+            new_summary = raw.content if hasattr(raw, "content") else (raw or "")
         except asyncio.CancelledError:
-            # /restart, /clear or /provider cancelled this background task.
-            # Don't touch state — the user wants a clean slate.
             logger.info("[Compact] Cancelled by user action.")
             raise
         except Exception as e:
             logger.warning(
                 f"[Compact] Summariser call failed: {e}. Falling back to hard trim."
             )
-            # Only trim if the live history is still the same list — otherwise
-            # /clear or /provider already reset state and we'd corrupt it.
             if session["history"] is original_history:
                 _trim_history(original_history)
             return False
 
-        # RACE GUARD — if /clear or /provider replaced the history list while
-        # we were awaiting the LLM, abort: don't write a stale summary against
-        # a freshly-reset session.
         if session["history"] is not original_history:
             logger.info(
                 "[Compact] Session was reset during compaction; discarding stale summary."
@@ -703,9 +479,6 @@ async def _compact_history(
         if len(new_summary) > MAX_SUMMARY_CHARS:
             new_summary = new_summary[:MAX_SUMMARY_CHARS].rstrip() + "\n…[truncated]"
 
-        # In-place delete preserves any messages the user appended during
-        # our await window — fixes the silent-message-loss bug where
-        # session["history"] = to_keep would clobber concurrent appends.
         del original_history[:split_at]
         session["summary"] = new_summary
         logger.info(
@@ -716,13 +489,10 @@ async def _compact_history(
 
 
 async def _maybe_compact(session: Dict, provider, model: Optional[str]) -> None:
-    """Fire compaction if history is over threshold. Never raises."""
     try:
         if len(session["history"]) > COMPACT_THRESHOLD:
             await _compact_history(session, provider, model)
         else:
-            # Belt-and-braces: still apply the hard cap if the compact path
-            # was skipped (shouldn't happen unless threshold > max).
             _trim_history(session["history"])
     except Exception as e:
         logger.warning(f"[Compact] _maybe_compact error: {e}")
@@ -730,21 +500,9 @@ async def _maybe_compact(session: Dict, provider, model: Optional[str]) -> None:
 
 
 def _schedule_compact(session: Dict, provider, model: Optional[str]) -> None:
-    """Schedule rolling-memory compaction as a fire-and-forget background task.
-
-    Keeps a strong reference to the task in session["_bg_tasks"] so the
-    event loop can't GC it mid-flight (per asyncio docs). The per-session
-    asyncio.Lock inside _compact_history serialises concurrent compactions,
-    so it's always safe to schedule another one.
-
-    The user never sees this: the handler returns to Telegram immediately
-    and the summariser call runs invisibly in the background.
-    """
     try:
         task = asyncio.create_task(_maybe_compact(session, provider, model))
     except RuntimeError:
-        # No running event loop (shouldn't happen inside a handler) —
-        # fall back to the synchronous hard cap so memory still stays bounded.
         _trim_history(session["history"])
         return
     bg: set = session.setdefault("_bg_tasks", set())
@@ -753,16 +511,6 @@ def _schedule_compact(session: Dict, provider, model: Optional[str]) -> None:
 
 
 def _cancel_bg_tasks(session: Dict) -> int:
-    """Cancel every in-flight background task on this session (e.g. compaction).
-
-    Called from /restart, /clear and /provider so a hard state reset also
-    aborts any pending summariser call. The underlying provider thread
-    can't actually be killed (asyncio.to_thread limitation) but cancelling
-    the task makes asyncio.wait_for raise CancelledError inside the
-    coroutine, which bypasses the summary-write step cleanly.
-
-    Returns the number of tasks cancelled.
-    """
     bg = session.get("_bg_tasks")
     if not bg:
         return 0
@@ -777,10 +525,6 @@ def _cancel_bg_tasks(session: Dict) -> int:
 
 
 async def reply_text_safe(message, text: str):
-    """Send Markdown first for better chat UI, fallback to plain text on parse error.
-
-    Re-raises if both sends fail so callers can roll back history / notify the user.
-    """
     try:
         await message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -852,23 +596,6 @@ def get_model_capability_score(model_id: str) -> tuple:
 
 
 def strip_thinking_tags(text: str, keep_thinking: bool = False) -> str:
-    """
-    Strip or preserve thinking/reasoning tags from AI responses.
-
-    Handles tags like:
-    - <think>...</think>
-    - <thinking>...</thinking>
-    - <context>...</context>
-    - <reasoning>...</reasoning>
-
-    Args:
-        text: The AI response text
-        keep_thinking: If True, formats thinking nicely. If False, removes it entirely.
-
-    Returns:
-        Filtered text
-    """
-    # Pattern to match thinking-related tags
     patterns = [
         (r"<think>(.*?)</think>", "thinking"),
         (r"<thinking>(.*?)</thinking>", "thinking"),
@@ -877,7 +604,6 @@ def strip_thinking_tags(text: str, keep_thinking: bool = False) -> str:
     ]
 
     if keep_thinking:
-        # Keep thinking but format it nicely
         result = text
         for pattern, label in patterns:
             matches = re.finditer(pattern, result, re.DOTALL | re.IGNORECASE)
@@ -887,11 +613,28 @@ def strip_thinking_tags(text: str, keep_thinking: bool = False) -> str:
                 result = result[: match.start()] + formatted + result[match.end() :]
         return result.strip()
     else:
-        # Remove all thinking tags and their content
         result = text
         for pattern, _ in patterns:
             result = re.sub(pattern, "", result, flags=re.DOTALL | re.IGNORECASE)
         return result.strip()
+
+
+class ChatResult:
+    """Unified return type from provider.chat() when tools are involved.
+
+    .content    — the assistant's text reply (may be empty if tool_calls fired)
+    .tool_calls — list of dicts: [{"name": str, "arguments": dict, "id": str}]
+                  empty list when the model answered directly
+    """
+
+    __slots__ = ("content", "tool_calls")
+
+    def __init__(self, content: str = "", tool_calls: Optional[list] = None):
+        self.content = content
+        self.tool_calls = tool_calls or []
+
+    def __bool__(self):
+        return bool(self.content or self.tool_calls)
 
 
 class AIProvider(ABC):
@@ -907,8 +650,15 @@ class AIProvider(ABC):
         model: Optional[str] = None,
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
-    ) -> str:
-        """Generate a chat response from the AI."""
+        tools: Optional[list] = None,
+    ) -> "ChatResult | str":
+        """Generate a chat response from the AI.
+
+        If tools is provided and the provider supports function calling,
+        return a ChatResult.  Providers that do NOT support tools must
+        ignore the parameter and return a plain string (or ChatResult with
+        no tool_calls) so the caller falls back gracefully.
+        """
         pass
 
     @abstractmethod
@@ -926,10 +676,15 @@ class AIProvider(ABC):
     def supports_thinking(self, model_id: str) -> bool:
         return False
 
+    def supports_function_calling(self) -> bool:
+        """Override to True in providers whose API supports OpenAI-style tools."""
+        return False
+
     def test_model(self, model_id: str) -> Tuple[bool, str]:
         try:
             response = self.chat([{"role": "user", "content": "Hi"}], model=model_id)
-            if response is not None and len(response) > 0:
+            content = response.content if isinstance(response, ChatResult) else response
+            if content is not None and len(content) > 0:
                 return (True, "success")
             return (False, "unknown")
         except Exception as e:
@@ -957,6 +712,46 @@ class AIProvider(ABC):
                 return (False, "unknown")
 
 
+# ── Helper: parse OpenAI-SDK tool_calls into our ChatResult format ──────────
+
+def _parse_openai_tool_calls(response) -> List[Dict]:
+    """Extract tool calls from an OpenAI-SDK completion response."""
+    calls = []
+    msg = response.choices[0].message if response.choices else None
+    if msg is None:
+        return calls
+    raw_calls = getattr(msg, "tool_calls", None) or []
+    for tc in raw_calls:
+        try:
+            arguments = json.loads(tc.function.arguments or "{}")
+        except (json.JSONDecodeError, AttributeError):
+            arguments = {}
+        calls.append({
+            "id": getattr(tc, "id", None) or "call_0",
+            "name": tc.function.name,
+            "arguments": arguments,
+        })
+    return calls
+
+
+def _openai_tool_result_message(tool_call: Dict, result_text: str) -> Dict:
+    """Build the tool result message for OpenAI-compatible providers."""
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "content": result_text,
+    }
+
+
+def _openai_assistant_tool_call_message(tool_calls_raw) -> Dict:
+    """Reconstruct the assistant message that requested tool calls (for multi-turn)."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": tool_calls_raw,
+    }
+
+
 class GroqProvider(AIProvider):
     def __init__(self, api_key: str):
         super().__init__()
@@ -965,27 +760,37 @@ class GroqProvider(AIProvider):
         self.client = Groq(api_key=api_key)
         self.default_model = "openai/gpt-oss-120b"
 
+    def supports_function_calling(self) -> bool:
+        return True
+
     def chat(
         self,
         messages: List[Dict],
         model: Optional[str] = None,
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
-    ) -> str:
+        tools: Optional[list] = None,
+    ) -> ChatResult:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get("role") == "system" for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-        response = self.client.chat.completions.create(
+
+        kwargs = dict(
             messages=chat_messages,
             model=model,
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        content = response.choices[0].message.content if response.choices else None
-        if not content:
-            raise ValueError("API returned empty response.")
-        return strip_thinking_tags(content, keep_thinking=enable_thinking)
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        response = self.client.chat.completions.create(**kwargs)
+        tool_calls = _parse_openai_tool_calls(response) if tools else []
+        content = response.choices[0].message.content if response.choices else ""
+        content = strip_thinking_tags(content or "", keep_thinking=enable_thinking)
+        return ChatResult(content=content, tool_calls=tool_calls)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -1023,12 +828,19 @@ class GroqProvider(AIProvider):
         return self.default_model
 
     def supports_thinking(self, model_id: str) -> bool:
-        """Groq models may include inline thinking tags in responses."""
         reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
         return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
 
 class GeminiProvider(AIProvider):
+    """Gemini via its native SDK.
+
+    The native SDK does not expose an easy OpenAI-compatible tool_calls flow,
+    so we fall back to system-prompt-based search context injection for this
+    provider.  Function calling is handled at the OpenAI-compat layer if the
+    user switches to Gemini via OpenRouter or a custom endpoint instead.
+    """
+
     def __init__(self, api_key: str):
         super().__init__()
         import google.generativeai as genai
@@ -1037,13 +849,18 @@ class GeminiProvider(AIProvider):
         self.genai = genai
         self.default_model = "gemini-flash-lite-latest"
 
+    def supports_function_calling(self) -> bool:
+        # Native SDK path does not use our OpenAI tool-call format
+        return False
+
     def chat(
         self,
         messages: List[Dict],
         model: Optional[str] = None,
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
-    ) -> str:
+        tools: Optional[list] = None,
+    ) -> ChatResult:
         if not messages:
             raise ValueError("Messages list cannot be empty")
         model_name = model or self.default_model
@@ -1062,11 +879,21 @@ class GeminiProvider(AIProvider):
         for msg in messages[:-1]:
             if msg["role"] == "system":
                 continue
+            # Skip tool result messages — not native-SDK-compatible
+            if msg.get("role") == "tool":
+                continue
             role = "user" if msg["role"] == "user" else "model"
-            chat_history.append({"role": role, "parts": [msg["content"]]})
+            content = msg.get("content") or ""
+            if content:
+                chat_history.append({"role": role, "parts": [content]})
+
+        last_content = messages[-1].get("content") or ""
         chat = gen_model.start_chat(history=chat_history)
-        response_text = chat.send_message(messages[-1]["content"]).text
-        return strip_thinking_tags(response_text, keep_thinking=enable_thinking)
+        response_text = chat.send_message(last_content).text if last_content else ""
+        return ChatResult(
+            content=strip_thinking_tags(response_text, keep_thinking=enable_thinking),
+            tool_calls=[],
+        )
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -1112,7 +939,6 @@ class GeminiProvider(AIProvider):
         return self.default_model
 
     def supports_thinking(self, model_id: str) -> bool:
-        """Gemini models may include inline thinking tags in responses."""
         reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1", "gemini-2"]
         return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
@@ -1131,27 +957,37 @@ class OpenRouterProvider(AIProvider):
         self.api_key = api_key
         self.default_model = "openrouter/free"
 
+    def supports_function_calling(self) -> bool:
+        return True
+
     def chat(
         self,
         messages: List[Dict],
         model: Optional[str] = None,
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
-    ) -> str:
+        tools: Optional[list] = None,
+    ) -> ChatResult:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get("role") == "system" for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-        response = self.client.chat.completions.create(
+
+        kwargs = dict(
             model=model,
             messages=chat_messages,
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        content = response.choices[0].message.content if response.choices else None
-        if not content:
-            raise ValueError("API returned empty response.")
-        return strip_thinking_tags(content, keep_thinking=enable_thinking)
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        response = self.client.chat.completions.create(**kwargs)
+        tool_calls = _parse_openai_tool_calls(response) if tools else []
+        content = response.choices[0].message.content if response.choices else ""
+        content = strip_thinking_tags(content or "", keep_thinking=enable_thinking)
+        return ChatResult(content=content, tool_calls=tool_calls)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -1220,7 +1056,6 @@ class OpenRouterProvider(AIProvider):
         return self.default_model
 
     def supports_thinking(self, model_id: str) -> bool:
-        """OpenRouter models (especially reasoning models) may include inline thinking tags."""
         reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
         return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
@@ -1233,27 +1068,37 @@ class CerebrasProvider(AIProvider):
         self.client = Cerebras(api_key=api_key)
         self.default_model = "llama3.1-8b"
 
+    def supports_function_calling(self) -> bool:
+        return True
+
     def chat(
         self,
         messages: List[Dict],
         model: Optional[str] = None,
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
-    ) -> str:
+        tools: Optional[list] = None,
+    ) -> ChatResult:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get("role") == "system" for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-        response = self.client.chat.completions.create(
+
+        kwargs = dict(
             messages=chat_messages,
             model=model,
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        content = response.choices[0].message.content if response.choices else None
-        if not content:
-            raise ValueError("API returned empty response.")
-        return strip_thinking_tags(content, keep_thinking=enable_thinking)
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        response = self.client.chat.completions.create(**kwargs)
+        tool_calls = _parse_openai_tool_calls(response) if tools else []
+        content = response.choices[0].message.content if response.choices else ""
+        content = strip_thinking_tags(content or "", keep_thinking=enable_thinking)
+        return ChatResult(content=content, tool_calls=tool_calls)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -1290,7 +1135,6 @@ class CerebrasProvider(AIProvider):
         return self.default_model
 
     def supports_thinking(self, model_id: str) -> bool:
-        """Cerebras models may include inline thinking tags in responses."""
         reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
         return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
@@ -1320,19 +1164,24 @@ class NvidiaProvider(AIProvider):
     def supports_thinking(self, model_id: str) -> bool:
         return model_id not in self.MODELS_WITHOUT_THINKING
 
+    def supports_function_calling(self) -> bool:
+        return True
+
     def chat(
         self,
         messages: List[Dict],
         model: Optional[str] = None,
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
-    ) -> str:
+        tools: Optional[list] = None,
+    ) -> ChatResult:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get("role") == "system" for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-        if enable_thinking and self.supports_thinking(model):
+        if enable_thinking and self.supports_thinking(model) and not tools:
+            # Streaming thinking path — incompatible with tool calls
             response = self.client.chat.completions.create(
                 messages=chat_messages,
                 model=model,
@@ -1353,18 +1202,14 @@ class NvidiaProvider(AIProvider):
             full = ""
             if reasoning_parts:
                 full = "💭 *Thinking:*\n" + "".join(reasoning_parts) + "\n\n"
-            return full + "".join(content_parts)
+            return ChatResult(content=full + "".join(content_parts), tool_calls=[])
         else:
-            # For thinking-capable models, explicitly disable thinking so the
-            # model doesn't burn its token budget on internal reasoning and
-            # return content=None (a NVIDIA-side quirk on models like
-            # nvidia/nemotron-3-super-120b-a12b).
             extra_body = (
                 {"chat_template_kwargs": {"thinking": False}}
                 if self.supports_thinking(model)
                 else {}
             )
-            response = self.client.chat.completions.create(
+            kwargs = dict(
                 messages=chat_messages,
                 model=model,
                 temperature=TEMPERATURE,
@@ -1372,10 +1217,16 @@ class NvidiaProvider(AIProvider):
                 stream=False,
                 **({"extra_body": extra_body} if extra_body else {}),
             )
-            content = response.choices[0].message.content if response.choices else None
-            if not content:
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+
+            response = self.client.chat.completions.create(**kwargs)
+            tool_calls = _parse_openai_tool_calls(response) if tools else []
+            content = response.choices[0].message.content if response.choices else ""
+            if not content and not tool_calls:
                 raise ValueError("API returned empty response.")
-            return content
+            return ChatResult(content=content or "", tool_calls=tool_calls)
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -1415,12 +1266,6 @@ class NvidiaProvider(AIProvider):
         return self.default_model
 
 
-# ============================================================================
-# CUSTOM PROVIDER  (any OpenAI-compatible endpoint)
-# Configure via: CUSTOM_BASE_URL, CUSTOM_API_KEY, CUSTOM_DEFAULT_MODEL
-# ============================================================================
-
-
 class CustomProvider(AIProvider):
     def __init__(self, api_key: str, base_url: str, default_model: str):
         super().__init__()
@@ -1436,11 +1281,9 @@ class CustomProvider(AIProvider):
         self.default_model = default_model
 
     def supports_thinking(self, model_id: str) -> bool:
-        """
-        Custom provider supports thinking for models that return inline thinking tags.
-        Override this or configure per-model if needed.
-        """
-        # By default, assume all custom models may include thinking tags
+        return True
+
+    def supports_function_calling(self) -> bool:
         return True
 
     def chat(
@@ -1449,23 +1292,30 @@ class CustomProvider(AIProvider):
         model: Optional[str] = None,
         enable_thinking: bool = False,
         max_tokens: Optional[int] = None,
-    ) -> str:
+        tools: Optional[list] = None,
+    ) -> ChatResult:
         model = model or self.default_model
         chat_messages = messages.copy()
         if not any(msg.get("role") == "system" for msg in chat_messages):
             chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-        response = self.client.chat.completions.create(
+
+        kwargs = dict(
             model=model,
             messages=chat_messages,
             temperature=TEMPERATURE,
             max_tokens=max_tokens or MAX_TOKENS,
         )
-        content = response.choices[0].message.content if response.choices else None
-        if not content:
-            raise ValueError("API returned empty response.")
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
-        # Filter thinking tags based on enable_thinking flag
-        return strip_thinking_tags(content, keep_thinking=enable_thinking)
+        response = self.client.chat.completions.create(**kwargs)
+        tool_calls = _parse_openai_tool_calls(response) if tools else []
+        content = response.choices[0].message.content if response.choices else ""
+        return ChatResult(
+            content=strip_thinking_tags(content or "", keep_thinking=enable_thinking),
+            tool_calls=tool_calls,
+        )
 
     def get_available_models(self) -> List[Dict[str, str]]:
         with self._models_lock:
@@ -1489,7 +1339,6 @@ class CustomProvider(AIProvider):
                 logger.warning(
                     f"⚠️ Custom: Could not fetch model list from {self.base_url}: {e}"
                 )
-            # Fall back to the configured default model only
             self._cached_models = [
                 {
                     "id": self.default_model,
@@ -1516,6 +1365,11 @@ class VercelProvider(CustomProvider):
 
     def get_name(self) -> str:
         return "Vercel"
+
+    def supports_thinking(self, model_id: str) -> bool:
+        # Default gateway model (Perplexity Sonar) emits no thinking tags;
+        # CustomProvider returns True unconditionally, which would be misleading.
+        return False
 
 
 # ============================================================================
@@ -1576,6 +1430,12 @@ class ProviderManager:
         if not self.providers:
             raise ValueError("No AI providers available! Set at least one API key.")
 
+        if DEFAULT_PROVIDER not in self.providers:
+            logger.warning(
+                f"⚠️ DEFAULT_PROVIDER='{DEFAULT_PROVIDER}' is not available — "
+                f"will fall back to '{self.list_providers()[0]}'"
+            )
+
     def get_provider(self, provider_name: str) -> Optional[AIProvider]:
         return self.providers.get(provider_name.lower())
 
@@ -1617,22 +1477,22 @@ def get_user_session(user_id: str) -> Dict:
             default_engine = "brave"
         else:
             default_engine = "duckduckgo"
+            if SEARCH_ENGINE not in ("duckduckgo", "ddg", ""):
+                logger.info(
+                    f"[Session] SEARCH_ENGINE='{SEARCH_ENGINE}' unavailable "
+                    "(missing key/URL) — defaulting to DuckDuckGo. "
+                    "The user can change it with /web."
+                )
         user_sessions[user_id] = {
             "provider": provider_manager.get_default_provider(),
             "models": {},
             "history": [],
-            # Rolling-memory summary (Claude-style /compact). Updated after
-            # every conversation that exceeds COMPACT_THRESHOLD. Always
-            # appended to the system prompt on subsequent chat calls.
             "summary": "",
             "thinking_enabled": False,
             "web_search": True,
             "search_engine": default_engine,
             "last_seen": now,
-            # asyncio.Event used by /restart to abort in-flight LLM calls
             "cancel_event": asyncio.Event(),
-            # Per-session lock so two near-simultaneous messages can't
-            # double-compact and stomp on each other's summary.
             "compact_lock": asyncio.Lock(),
         }
     else:
@@ -1647,7 +1507,6 @@ def is_user_allowed(user_id: str) -> bool:
 
 
 def _resolve_provider(session: Dict):
-    """Return (provider_name, provider) — auto-corrects stale provider."""
     name = session["provider"]
     prov = provider_manager.get_provider(name)
     if not prov:
@@ -1661,10 +1520,6 @@ def _resolve_provider(session: Dict):
 # MODEL VALIDATION CACHE
 # ============================================================================
 
-
-# In-memory cache — single source of truth; disk is persistence only.
-# All add/get operations mutate this dict directly, eliminating the
-# load→modify→save race that occurs when two concurrent /validate runs interleave.
 _validated_cache: Optional[Dict] = None
 
 
@@ -1738,7 +1593,9 @@ def clear_validated_models(provider_name: Optional[str] = None):
 
 
 # ============================================================================
-# WEB SEARCH — Brave API + ddgs (multi-backend) + SearXNG
+# WEB SEARCH BACKENDS — Brave, SearXNG, DuckDuckGo
+# (These functions are unchanged — function calling only changes HOW the
+#  model triggers them, not how the actual HTTP requests work.)
 # ============================================================================
 
 
@@ -1829,6 +1686,166 @@ async def web_search(query: str, engine: str) -> list:
     return await asyncio.to_thread(_duckduckgo_search_sync, query)
 
 
+def _format_search_results(query: str, snippets: list) -> str:
+    """Format search snippets as a tool result string."""
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    parts = [f"Today is {today}. Web search results for '{query}':"]
+    for i, snip in enumerate(snippets, 1):
+        parts.append(f"{i}. {snip}")
+    parts.append(
+        "\nAnswer using ONLY the information above. If it does not answer the "
+        "question, say so plainly instead of filling gaps from memory."
+    )
+    return "\n".join(parts)
+
+
+# ============================================================================
+# FUNCTION-CALLING SEARCH FLOW
+#
+# FLOW (providers that support function calling):
+#
+#   Call 1 — main call with WEB_SEARCH_TOOL attached:
+#     • Model answers directly           → done in 1 call (no search needed)
+#     • Model emits tool_calls           → execute search, inject result, Call 2
+#
+#   Call 2 — follow-up with tool result in messages:
+#     • Model answers using search data  → done
+#
+# FALLBACK (providers without function calling, e.g. Gemini native SDK):
+#   Same as before: single direct AI call. The system prompt already instructs
+#   the model to mention if it's uncertain; the user can enable /web on to
+#   append search results via a manual query when needed.
+#
+# ============================================================================
+
+
+async def _execute_tool_call(tool_call: Dict, engine: str) -> str:
+    """Run the tool the model requested and return the result as a string."""
+    name = tool_call.get("name", "")
+    args = tool_call.get("arguments", {})
+
+    if name == "web_search":
+        query = args.get("query", "").strip()
+        if not query:
+            return "Error: web_search called with empty query."
+        logger.info(f"[FuncCall] web_search('{query}') via {engine}")
+        snippets = await web_search(query, engine)
+        if not snippets:
+            return (
+                f"The web search for '{query}' returned no usable results. "
+                "Tell the user plainly that you could not find current "
+                "information on this topic, and do NOT answer from memory."
+            )
+        return _format_search_results(query, snippets)
+
+    return f"Unknown tool: {name}"
+
+
+async def _chat_with_function_calling(
+    provider,
+    messages: list,
+    model: Optional[str],
+    enable_thinking: bool,
+    web_on: bool,
+    engine: str,
+    cancel_event: Optional["asyncio.Event"] = None,
+) -> str:
+    """Single-entry-point for the function-calling search flow.
+
+    For providers that support function calling:
+      1. Call model with WEB_SEARCH_TOOL; if it picks up tool_calls → execute
+         search and make a second call with the result injected.
+      2. If model answers directly in Call 1, return that immediately.
+
+    For providers without function calling:
+      Make one direct call without tools (same as the old no-search path).
+      The system prompt still encourages the model to be honest about
+      uncertainty, and web_on state is displayed in /status for transparency.
+
+    Returns the final text response string.
+    """
+    use_tools = web_on and provider.supports_function_calling()
+    tools = [WEB_SEARCH_TOOL] if use_tools else None
+
+    # ── Call 1 ────────────────────────────────────────────────────────────────
+    result = await _chat_with_retry(
+        provider,
+        messages=messages,
+        model=model,
+        enable_thinking=enable_thinking,
+        tools=tools,
+        cancel_event=cancel_event,
+    )
+
+    # Normalise: older providers may return a plain string
+    if isinstance(result, str):
+        return result or "⚠️ The AI returned an empty response."
+
+    chat_result: ChatResult = result
+
+    # ── No tool call — model answered directly ────────────────────────────────
+    if not chat_result.tool_calls:
+        return chat_result.content or "⚠️ The AI returned an empty response."
+
+    # ── Tool call(s) — execute each, then Call 2 ─────────────────────────────
+    if cancel_event and cancel_event.is_set():
+        raise asyncio.CancelledError("Cancelled by /restart")
+
+    # We only handle one tool call per turn (web_search). If the model somehow
+    # emits multiple, we process the first and ignore the rest — this is safe
+    # because web_search is the only registered tool.
+    tool_call = chat_result.tool_calls[0]
+    tool_result_text = await _execute_tool_call(tool_call, engine)
+
+    if cancel_event and cancel_event.is_set():
+        raise asyncio.CancelledError("Cancelled by /restart")
+
+    # Reconstruct the conversation thread for Call 2.
+    # OpenAI spec: after an assistant message with tool_calls, we must append
+    # the assistant message (with the tool_calls list) and then the tool result.
+    follow_up_messages = list(messages)
+
+    # Rebuild the raw tool_calls structure the SDK expects
+    raw_tool_calls = []
+    for tc in chat_result.tool_calls:
+        raw_tool_calls.append({
+            "id": tc.get("id") or "call_0",
+            "type": "function",
+            "function": {
+                "name": tc["name"],
+                "arguments": json.dumps(tc.get("arguments", {})),
+            },
+        })
+
+    follow_up_messages.append({
+        "role": "assistant",
+        "content": chat_result.content or None,
+        "tool_calls": raw_tool_calls,
+    })
+    follow_up_messages.append({
+        "role": "tool",
+        "tool_call_id": tool_call.get("id", "call_0"),
+        "content": tool_result_text,
+    })
+
+    logger.info("[FuncCall] Tool result injected, making Call 2 for final answer")
+
+    # ── Call 2 — final answer with search results ─────────────────────────────
+    result2 = await _chat_with_retry(
+        provider,
+        messages=follow_up_messages,
+        model=model,
+        enable_thinking=enable_thinking,
+        tools=None,  # No more tool calls in the follow-up
+        cancel_event=cancel_event,
+    )
+
+    if isinstance(result2, str):
+        return result2 or "⚠️ The AI returned an empty response."
+
+    return result2.content or "⚠️ The AI returned an empty response."
+
+
 # ============================================================================
 # COMMAND HANDLERS
 # ============================================================================
@@ -1844,11 +1861,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_user_session(user_id)
     _, provider = _resolve_provider(session)
     web_status = "ON" if session.get("web_search") else "OFF"
+    fc_status = "✅ function calling" if provider.supports_function_calling() else "⚠️ direct (no tool support)"
     await update.message.reply_text(
         f"🤖 Hello! I'm your Multi-Provider AI assistant.\n\n"
         f"📡 Current Provider: *{provider.get_name()}*\n"
         f"🔧 Available Providers: {', '.join(provider_manager.list_providers())}\n"
-        f"🌐 Web Search: {web_status}\n\n"
+        f"🌐 Web Search: {web_status} ({fc_status})\n\n"
         f"Just send me a message or a photo!\n\n"
         f"*Commands:*\n"
         f"/status - Show current settings & stats\n"
@@ -1872,8 +1890,6 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     session = get_user_session(user_id)
-    # Abort any in-flight background compaction first so it can't write a
-    # stale summary back over the freshly-cleared state.
     _cancel_bg_tasks(session)
     session["history"] = []
     session["summary"] = ""
@@ -1913,12 +1929,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/models all` — all models from API\n"
         "• `/model <id>` — switch model\n"
         "• `/refresh` — refresh model lists\n\n"
-        "*Web Search:*\n"
+        "*Web Search (function calling):*\n"
         "• `/web` — show status\n"
         "• `/web on` / `/web off` — toggle\n"
         "• `/web brave` — Brave Search API\n"
         "• `/web searxng` — SearXNG (self-hosted)\n"
         "• `/web ddg` — DuckDuckGo (free)\n\n"
+        "_When web search is ON and your provider supports function calling, "
+        "the model decides autonomously whether to search — no extra routing call needed._\n\n"
         "*Model Validation:*\n"
         "• `/validate` — test which models work\n"
         "• `/verified` — show validated models\n"
@@ -1926,9 +1944,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Thinking Mode (NVIDIA only):*\n"
         "• `/thinking on` / `/thinking off`\n\n"
         "*Image OCR:*\n"
-        "• Send any photo — text is extracted via NVIDIA vision\n"
+        "• Send any photo — text is extracted via vision model\n"
         "• Add a caption to ask a specific question about the image\n"
-        "• Requires `NVIDIA_API_KEY` to be set\n\n"
+        "• Requires `OCR_API_KEY` / `GEMINI_API_KEY` to be set\n\n"
         "*Other:*\n"
         "• `/status` — show provider, model, toggles & stats\n"
         "• `/clear` — clear conversation\n"
@@ -1963,16 +1981,14 @@ async def provider_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Available: {', '.join(provider_manager.list_providers())}"
         )
         return
-    # Cancel any pending background compaction on the OLD provider before
-    # we swap — otherwise its summary could land in the new provider's session.
     _cancel_bg_tasks(session)
     session["provider"] = new_name
-    # Old provider may have produced incompatible context formatting / summary
     session["history"] = []
     session["summary"] = ""
     current_model = session["models"].get(new_name) or new_provider.get_default_model()
+    fc = "✅ supports function calling" if new_provider.supports_function_calling() else "⚠️ no function calling"
     await update.message.reply_text(
-        f"✅ Switched to *{new_provider.get_name()}*!\nModel: `{current_model}`",
+        f"✅ Switched to *{new_provider.get_name()}*!\nModel: `{current_model}`\n_{fc}_",
         parse_mode="Markdown",
     )
 
@@ -2051,9 +2067,17 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     new_model = " ".join(context.args)
-    model_ids = [
-        m["id"] for m in await asyncio.to_thread(provider.get_available_models)
-    ]
+    try:
+        model_ids = [
+            m["id"] for m in await asyncio.to_thread(provider.get_available_models)
+        ]
+    except Exception as e:
+        logger.error(f"[Model] Could not fetch model list for {provider_name}: {e}")
+        await update.message.reply_text(
+            "❌ Could not verify the model (model list fetch failed).\n"
+            "No change made — try again later."
+        )
+        return
     session["models"][provider_name] = new_model
     if new_model in model_ids:
         await update.message.reply_text(
@@ -2105,9 +2129,14 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ All models already validated!\n\nUse `/verified` to see them."
         )
         return
+    cancel_event = asyncio.Event()
+    session["cancel_event"] = cancel_event  # lets /restart abort the validation loop
+
     validated = list(already_validated)
     newly_validated, failed_na, failed_rl, failed_unk = [], [], [], []
     for idx, model_info in enumerate(models_to_test, 1):
+        if cancel_event.is_set():
+            break
         model_id = model_info["id"]
         if idx % 5 == 0 or idx == 1:
             await update.message.reply_text(
@@ -2127,12 +2156,18 @@ async def validate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             failed_unk.append(model_id)
         if idx < len(models_to_test):
-            await asyncio.sleep(2)
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=2)
+                break
+            except asyncio.TimeoutError:
+                pass
+    job_cancelled = cancel_event.is_set()
+    total_tested = len(newly_validated) + len(failed_na) + len(failed_rl) + len(failed_unk)
     total_failed = len(failed_na) + len(failed_rl) + len(failed_unk)
-    rate = (len(newly_validated) / len(models_to_test) * 100) if models_to_test else 0
+    rate = (len(newly_validated) / total_tested * 100) if total_tested else 0
     msg = (
-        f"✅ *Validation Complete*\n\n"
-        f"• Tested: {len(models_to_test)}\n"
+        f"{'⏹️ *Validation Stopped* (via /restart)' if job_cancelled else '✅ *Validation Complete*'}\n\n"
+        f"• Tested: {total_tested}/{len(models_to_test)}\n"
         f"• ✅ Newly validated: {len(newly_validated)}\n"
         f"• ❌ Failed: {total_failed}\n"
     )
@@ -2211,7 +2246,6 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session["models"].get(provider_name) or provider.get_default_model()
         )
         supports = provider.supports_thinking(current_model)
-
         await update.message.reply_text(
             f"✅ *Thinking mode enabled!* 💭\n\n"
             f"Provider: `{provider_name}`\n"
@@ -2226,7 +2260,7 @@ async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            f"❌ Use `/thinking on` or `/thinking off`", parse_mode="Markdown"
+            "❌ Use `/thinking on` or `/thinking off`", parse_mode="Markdown"
         )
 
 
@@ -2253,6 +2287,8 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     session = get_user_session(user_id)
+    _, provider = _resolve_provider(session)
+
     if not context.args:
         status = "ON" if session.get("web_search") else "OFF"
         eng = session.get("search_engine", "duckduckgo")
@@ -2261,12 +2297,18 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "searxng": "SearXNG",
             "duckduckgo": "DuckDuckGo",
         }.get(eng, eng)
+        fc_note = (
+            "✅ Function calling active — model triggers search automatically."
+            if provider.supports_function_calling()
+            else "⚠️ Provider has no function calling — search unavailable for this provider."
+        )
         searxng_line = (
-            f"`/web searxng` — SearXNG (self-hosted)\n" if SEARXNG_URL else ""
+            "`/web searxng` — SearXNG (self-hosted)\n" if SEARXNG_URL else ""
         )
         await update.message.reply_text(
             f"🌐 *Web Search:* {status}\n"
-            f"🔍 *Engine:* {eng_label}\n\n"
+            f"🔍 *Engine:* {eng_label}\n"
+            f"⚙️ {fc_note}\n\n"
             f"Use: `/web on` | `/web off`\n"
             f"`/web brave` — Brave Search API\n"
             f"{searxng_line}"
@@ -2316,13 +2358,7 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ============================================================================
-# RESTART COMMAND — abort any in-flight LLM request for this user
-# ============================================================================
-
-
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show a concise one-screen status: provider, model, toggles, memory."""
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
         await update.message.reply_text(
@@ -2341,11 +2377,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "searxng": "SearXNG",
         "duckduckgo": "DuckDuckGo",
     }.get(engine, engine)
-    web_line = f"ON ({engine_label})" if web_on else "OFF"
+
+    if web_on and provider.supports_function_calling():
+        web_line = f"ON ({engine_label}, function calling ✅)"
+    elif web_on:
+        web_line = f"ON ({engine_label}, ⚠️ provider lacks function calling)"
+    else:
+        web_line = "OFF"
 
     thinking_on = session.get("thinking_enabled", False)
-    # Thinking is only honoured by NVIDIA today — flag that clearly so the
-    # status doesn't lie when the user toggled it on a non-NVIDIA provider.
     if thinking_on and provider_name != "nvidia":
         thinking_line = "ON (NVIDIA only — ignored here)"
     else:
@@ -2368,14 +2408,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel an in-flight AI request that is taking too long.
-
-    Sets the user's cancel_event so that:
-    - handle_message exits at the next cancellation checkpoint
-    - _chat_with_retry aborts its current asyncio.to_thread call or wakes
-      early from a retry-backoff sleep
-    The event is automatically cleared at the start of the next message.
-    """
     user_id = str(update.effective_user.id)
     if not is_user_allowed(user_id):
         await update.message.reply_text(
@@ -2384,11 +2416,10 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     session = get_user_session(user_id)
     cancel_event: asyncio.Event = session["cancel_event"]
-    cancel_event.set()  # signal any in-flight answer LLM call to abort
-    # Also cancel any background compaction so we don't waste API calls on
-    # a conversation the user is clearly resetting.
+    cancel_event.set()  # aborts the in-flight request that still holds this event
     _cancel_bg_tasks(session)
-    # Roll back any dangling user message added to history before the abort
+    # The event is replaced lazily: the next incoming message installs a fresh
+    # one, so pressing /restart again still aborts the same task until it exits.
     history = session["history"]
     if history and history[-1].get("role") == "user":
         history.pop()
@@ -2399,25 +2430,24 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
-# MESSAGE HANDLER — AI-routed search (v4)
+# MESSAGE HANDLER — function-calling search
 #
 # FLOW:
 #
-#   Quick filter (greeting / very short):
-#     → 1 AI call, no search overhead
+#   Web ON  + provider supports tools  →  _chat_with_function_calling()
+#     • Call 1: model gets WEB_SEARCH_TOOL definition
+#       - Answers directly            → 1 total LLM call, zero search overhead
+#       - Emits tool_calls            → execute search, Call 2 with results
+#                                        → final answer using live data
 #
-#   Everything else:
-#     → 1 lightweight AI decision call (SEARCH/NOSEARCH)
-#       NOSEARCH → 1 AI call with full system prompt → reply
-#       SEARCH   → web_search → 1 AI call with results + full system prompt → reply
+#   Web OFF or provider has no tools  →  single direct AI call (no search)
 #
-# WHY BETTER THAN 3-TIER HEURISTICS:
-#   - "playlist" no longer hits "list" keyword → no false no-search
-#   - "barcode" no longer hits "code" → no false no-search
-#   - "today's code review" no longer triggers direct search
-#   - Answers ALWAYS from full SYSTEM_PROMPT, never from decision prompt
-#   - AI crafts optimised search queries vs dumb prefix stripping
-#   - Cost: +1 small API call (max_tokens implicit, temp=0) per non-trivial message
+# WHY BETTER THAN THE OLD TWO-CALL ROUTER:
+#   - No dedicated SEARCH/NOSEARCH call; the decision happens inside Call 1
+#   - No text parsing / regex; query arrives as structured JSON
+#   - Model crafts the query in context, not in an isolated router prompt
+#   - Greetings & trivial messages cost exactly 1 call (model doesn't fire tool)
+#   - Same or fewer total LLM calls in every scenario
 # ============================================================================
 
 
@@ -2440,133 +2470,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     session = get_user_session(user_id)
-    cancel_event: asyncio.Event = session["cancel_event"]
-    # Clear any previous /restart signal so this request starts fresh
-    cancel_event.clear()
+    # Any prior abort signal is consumed here when we install a fresh event;
+    # an already-aborted AI call exits on its own, so the install is safe.
+    cancel_event = asyncio.Event()
+    session["cancel_event"] = cancel_event
     assistant_appended = False
 
     try:
         if cancel_event.is_set():
-            return  # race: /restart arrived between clear() and here — abort silently
+            return
+
         try:
             await update.message.chat.send_action(action="typing")
         except Exception:
             pass
 
         provider_name, provider = _resolve_provider(session)
-        current_model = session["models"].get(provider_name)  # None = provider default
+        current_model = session["models"].get(provider_name)
         thinking_enabled = session.get("thinking_enabled", False)
         web_on = session.get("web_search", True)
+        engine = session.get("search_engine", "duckduckgo")
 
         # Append user message (popped on error below)
         session["history"].append({"role": "user", "content": user_message})
 
-        # ── AI SEARCH DECISION ─────────────────────────────────────────────
-        skip = not web_on or _skip_search_decision(user_message)
-        search_query = None
+        # Build the messages list for the LLM — system prompt always first
+        chat_msgs = [
+            {"role": "system", "content": _build_system_prompt(session)}
+        ] + session["history"]
 
-        if not skip:
-            if cancel_event.is_set():
-                raise asyncio.CancelledError("Cancelled by /restart")
-            logger.info(
-                f"[Bot] user={user_id} provider={provider_name} → asking AI for search decision"
-            )
-            try:
-                await update.message.chat.send_action(action="typing")
-            except Exception:
-                pass
-            search_query = await ai_decide_search(
-                provider, current_model, session["history"]
-            )
-            logger.info(
-                f"[Bot] Decision: {'SEARCH: ' + search_query if search_query else 'NOSEARCH'}"
-            )
-
-        bot_response = ""
-
-        # ── SEARCH PATH ───────────────────────────────────────────────────
-        if search_query:
-            engine = session.get("search_engine", "duckduckgo")
-            logger.info(f"[Bot] Searching ({engine}): '{search_query}'")
-
-            try:
-                await update.message.chat.send_action(action="typing")
-            except Exception:
-                pass
-            snippets = await web_search(search_query, engine)
-
-            if snippets:
-                ctx = _build_search_context(search_query, snippets)
-                search_msgs = session["history"][:-1].copy()
-                search_msgs.append(
-                    {"role": "user", "content": user_message + "\n\n" + ctx}
-                )
-                # System prompt = base-with-results + rolling memory
-                search_msgs.insert(
-                    0,
-                    {
-                        "role": "system",
-                        "content": _build_system_prompt(
-                            session, SYSTEM_PROMPT_WITH_RESULTS
-                        ),
-                    },
-                )
-
-                if cancel_event.is_set():
-                    raise asyncio.CancelledError("Cancelled by /restart")
-                try:
-                    await update.message.chat.send_action(action="typing")
-                except Exception:
-                    pass
-                bot_response = await _chat_with_retry(
-                    provider,
-                    messages=search_msgs,
-                    model=current_model,
-                    enable_thinking=thinking_enabled,
-                    cancel_event=cancel_event,
-                )
-            else:
-                logger.warning(
-                    "[Bot] Search returned no results — falling back to direct AI"
-                )
-                fallback_msgs = [
-                    {"role": "system", "content": _build_system_prompt(session)}
-                ] + session["history"]
-                bot_response = await _chat_with_retry(
-                    provider,
-                    messages=fallback_msgs,
-                    model=current_model,
-                    enable_thinking=thinking_enabled,
-                    cancel_event=cancel_event,
-                )
-
-        # ── NO-SEARCH PATH ────────────────────────────────────────────────
-        else:
-            if cancel_event.is_set():
-                raise asyncio.CancelledError("Cancelled by /restart")
-            if skip:
-                logger.info(
-                    f"[Bot] user={user_id} provider={provider_name} → quick-filter skip, direct AI call"
-                )
-            chat_msgs = [
-                {"role": "system", "content": _build_system_prompt(session)}
-            ] + session["history"]
-            bot_response = await _chat_with_retry(
-                provider,
-                messages=chat_msgs,
-                model=current_model,
-                enable_thinking=thinking_enabled,
-                cancel_event=cancel_event,
-            )
-
-        # ── /restart race guard ────────────────────────────────────────────
-        # _chat_with_retry may have returned successfully while /restart
-        # fired in parallel and already popped our user message. If we
-        # appended the assistant now, we'd strand it without its user.
         if cancel_event.is_set():
             raise asyncio.CancelledError("Cancelled by /restart")
 
-        # ── Fallback for empty response ────────────────────────────────────
+        try:
+            await update.message.chat.send_action(action="typing")
+        except Exception:
+            pass
+
+        bot_response = await _chat_with_function_calling(
+            provider=provider,
+            messages=chat_msgs,
+            model=current_model,
+            enable_thinking=thinking_enabled,
+            web_on=web_on,
+            engine=engine,
+            cancel_event=cancel_event,
+        )
+
+        # ── /restart race guard ────────────────────────────────────────────
+        if cancel_event.is_set():
+            raise asyncio.CancelledError("Cancelled by /restart")
+
         if not bot_response.strip():
             bot_response = "⚠️ The AI returned an empty response. Try again or use `/model` to switch models."
 
@@ -2603,14 +2557,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 header = f"📄 Part {i}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
                 await reply_text_safe(update.message, header + chunk)
 
-        # ── Rolling-memory compaction (fire-and-forget background task so
-        # the user never sees latency or any UI indication). Per-session
-        # lock inside the task serialises concurrent compactions.
         _schedule_compact(session, provider, current_model)
 
     except asyncio.CancelledError:
-        # /restart was issued — clean up history silently (restart_command already
-        # sent the user-facing message and may have trimmed the last user turn).
         logger.info(f"[Bot] user={user_id} request cancelled by /restart")
         if (
             assistant_appended
@@ -2622,8 +2571,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session["history"].pop()
     except Exception as e:
         logger.error(f"Error in handle_message: {e}", exc_info=True)
-        # Roll back the incomplete exchange so history stays consistent.
-        # Assistant message first (innermost), then user message.
         if (
             assistant_appended
             and session["history"]
@@ -2643,37 +2590,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
-# IMAGE OCR — NVIDIA vision API, fully in-memory (no disk)
-#
-# SINGLE PHOTO FLOW:
-#   Telegram photo → BytesIO (RAM) → base64 → NVIDIA streaming API → reply
-#
-# ALBUM (multi-photo) FLOW:
-#   Telegram sends each photo as a separate Update sharing a media_group_id.
-#   Each update is buffered for _MEDIA_GROUP_WAIT seconds. Once the window
-#   closes, all photos are processed sequentially and one combined reply is
-#   sent. RAM is freed after every individual photo — only one photo lives
-#   in memory at a time even for large albums.
+# IMAGE OCR
 # ============================================================================
 
 _NVIDIA_VISION_URL = f"{VISION_BASE_URL}/chat/completions"
-_MEDIA_GROUP_WAIT = 1.5  # seconds to collect all photos in an album
-_OCR_MAX_RETRIES = 2  # retry the NVIDIA API call up to 2 extra times
-_OCR_RETRY_BASE_DELAY = 3.0  # seconds; doubles each attempt (3s, 6s)
+_MEDIA_GROUP_WAIT = 1.5
+_OCR_MAX_RETRIES = 2
+_OCR_RETRY_BASE_DELAY = 3.0
 _DEFAULT_OCR_PROMPT = (
     "Extract and transcribe ALL text visible in this image exactly as written. "
     "If there is no text, describe the image content concisely."
 )
 
-# {media_group_id: {"photos": [...], "message": msg, "prompt": str,
-#                   "user_id": str, "session": dict}}
 _media_group_buffer: Dict[str, dict] = {}
-# {media_group_id: asyncio.Task}  — one flush task per in-flight album
 _media_group_tasks: Dict[str, "asyncio.Task[None]"] = {}
 
 
 def _nvidia_vision_sync(b64_data: str, prompt: str) -> str:
-    """Blocking NVIDIA vision call. Runs inside asyncio.to_thread — never call directly."""
     headers = {
         "Authorization": f"Bearer {OCR_API_KEY}",
         "Accept": "text/event-stream",
@@ -2722,38 +2655,36 @@ def _nvidia_vision_sync(b64_data: str, prompt: str) -> str:
 
 
 async def _ocr_one_photo(context, photo_obj, prompt: str, user_id: str) -> str:
-    """Download a single Telegram photo to RAM, OCR it, return result text.
-
-    The NVIDIA API call is retried up to _OCR_MAX_RETRIES times on transient
-    errors (rate limit, timeout, 5xx). The base64 string is kept in memory
-    across retries so the image is never re-downloaded. Both raw bytes and
-    the base64 string are deleted in the finally block regardless of outcome.
-    """
     buf: Optional[io.BytesIO] = None
     b64_str: Optional[str] = None
     try:
-        # ── Download to RAM ───────────────────────────────────────────────
         tg_file = await context.bot.get_file(photo_obj.file_id)
         buf = io.BytesIO()
         await tg_file.download_to_memory(buf)
+        # photo.file_size can be reported as None by some clients — enforce the
+        # limit on the actual downloaded bytes too.
+        actual_size = buf.tell()
+        if actual_size > MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"Image too large after download "
+                f"({actual_size / 1024 / 1024:.1f} MB, "
+                f"max {MAX_IMAGE_BYTES / 1024 / 1024:.0f} MB)."
+            )
         logger.info(
             f"[OCR] user={user_id} size={buf.tell() / 1024:.1f} KB model={NVIDIA_VISION_MODEL}"
         )
 
-        # ── Encode once; free raw bytes immediately ───────────────────────
         b64_str = base64.b64encode(buf.getvalue()).decode()
         buf.close()
         del buf
         buf = None
 
-        # ── API call with retry ───────────────────────────────────────────
         last_error: Optional[Exception] = None
         for attempt in range(1, _OCR_MAX_RETRIES + 2):
             try:
                 result = await asyncio.to_thread(_nvidia_vision_sync, b64_str, prompt)
                 if result.strip():
                     return result.strip()
-                # Empty response — treat as transient and retry
                 logger.warning(
                     f"[OCR] attempt {attempt}: empty response from model, retrying..."
                 )
@@ -2761,7 +2692,7 @@ async def _ocr_one_photo(context, photo_obj, prompt: str, user_id: str) -> str:
                 last_error = e
                 error_lower = str(e).lower()
                 if not any(kw in error_lower for kw in _TRANSIENT_ERROR_KEYWORDS):
-                    raise  # Permanent error (bad key, invalid model, etc.) — fail immediately
+                    raise
                 logger.warning(f"[OCR] attempt {attempt} transient error: {e}")
 
             if attempt <= _OCR_MAX_RETRIES:
@@ -2787,7 +2718,6 @@ async def _ocr_one_photo(context, photo_obj, prompt: str, user_id: str) -> str:
 
 
 async def _send_ocr_reply(message, text: str):
-    """Send OCR text, splitting at Telegram's 4096-char limit if needed."""
     if len(text) <= MAX_MESSAGE_LENGTH:
         await reply_text_safe(message, text)
         return
@@ -2815,7 +2745,6 @@ async def _send_ocr_reply(message, text: str):
 
 
 async def _flush_media_group(group_id: str, context):
-    """Wait for the album collection window, then OCR all photos and send one reply."""
     await asyncio.sleep(_MEDIA_GROUP_WAIT)
 
     entry = _media_group_buffer.pop(group_id, None)
@@ -2824,15 +2753,30 @@ async def _flush_media_group(group_id: str, context):
         return
 
     photos = entry["photos"]
-    message = entry["message"]
-    prompt = entry["prompt"]
     user_id = entry["user_id"]
-    session = entry["session"]
     total = len(photos)
 
     logger.info(
         f"[OCR] album {group_id}: processing {total} photo(s) for user={user_id}"
     )
+
+    try:
+        await _process_media_group(entry, group_id, context)
+    except Exception:
+        logger.error(f"[OCR] album {group_id} flush failed", exc_info=True)
+    finally:
+        # Guarantee cleanup even if an exception or task cancellation hits mid-way.
+        _media_group_buffer.pop(group_id, None)
+        _media_group_tasks.pop(group_id, None)
+
+
+async def _process_media_group(entry: dict, group_id: str, context) -> None:
+    photos = entry["photos"]
+    message = entry["message"]
+    prompt = entry["prompt"]
+    user_id = entry["user_id"]
+    session = entry["session"]
+    total = len(photos)
 
     try:
         await message.chat.send_action(action="typing")
@@ -2853,14 +2797,12 @@ async def _flush_media_group(group_id: str, context):
             result = f"⚠️ Failed to process image {idx}: {e}"
         results.append(result)
 
-    # Build combined reply — single photo gets no wrapper, album gets numbered sections
     if total == 1:
         combined = results[0]
     else:
         sections = [f"*Image {i}/{total}*\n{r}" for i, r in enumerate(results, 1)]
         combined = "\n\n---\n\n".join(sections)
 
-    # Store a text-only placeholder in history (no base64 ever enters history)
     session["history"].append(
         {"role": "user", "content": f"[{total} image(s)] {prompt}"}
     )
@@ -2894,7 +2836,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    photo = update.message.photo[-1]  # largest resolution variant
+    photo = update.message.photo[-1]
     prompt = (
         update.message.caption.strip()
         if update.message.caption
@@ -2903,15 +2845,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if photo.file_size and photo.file_size > MAX_IMAGE_BYTES:
         await update.message.reply_text(
-            f"❌ Image too large ({photo.file_size // 1024:,} KB). "
-            f"Max allowed: {MAX_IMAGE_BYTES // 1024 // 1024} MB."
+            f"❌ Image too large ({photo.file_size / 1024 / 1024:.1f} MB). "
+            f"Max allowed: {MAX_IMAGE_BYTES / 1024 / 1024:.0f} MB."
         )
         return
 
     session = get_user_session(user_id)
-    group_id = update.message.media_group_id  # None for single photos
+    group_id = update.message.media_group_id
 
-    # ── ALBUM: buffer and schedule a flush task ───────────────────────────
     if group_id is not None:
         if group_id not in _media_group_buffer:
             _media_group_buffer[group_id] = {
@@ -2924,8 +2865,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _media_group_tasks[group_id] = asyncio.create_task(
                 _flush_media_group(group_id, context)
             )
-        # Telegram only attaches the caption to the first photo in a group;
-        # update prompt if this message carries one.
         if update.message.caption:
             _media_group_buffer[group_id]["prompt"] = prompt
         _media_group_buffer[group_id]["photos"].append(photo)
@@ -2935,7 +2874,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── SINGLE PHOTO: process immediately ────────────────────────────────
     try:
         await update.message.chat.send_action(action="typing")
     except Exception:
@@ -3009,6 +2947,12 @@ def main():
 
     logger.info("🚀 Multi-Provider AI Bot started!")
     logger.info(f"📡 Providers: {', '.join(provider_manager.list_providers())}")
+
+    # Log function calling support per provider
+    for name, prov in provider_manager.providers.items():
+        fc = "✅ function calling" if prov.supports_function_calling() else "⚠️  no function calling"
+        logger.info(f"   {name}: {fc}")
+
     if OCR_API_KEY:
         logger.info(
             f"🖼️  Image OCR enabled — model: {NVIDIA_VISION_MODEL} endpoint: {VISION_BASE_URL}"
@@ -3022,62 +2966,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ============================================================================
-# TESTS (commented out - uncomment to run)
-# ============================================================================
-
-# def test_strip_thinking_tags():
-#     """Test the strip_thinking_tags function with various inputs."""
-#
-#     # Test 1: Simple <think> tag removal
-#     input1 = """<think>
-# The user is asking who is the USA president now. The current date is Thursday, April 16, 2026, 9:57:20 AM UTC.
-#
-# Looking at the search results:
-# - Donald Trump is the 47th president of the United States
-# </think>
-#
-# Donald Trump is the 47th president of the United States. He was inaugurated on January 20, 2025."""
-#
-#     result_no_thinking = strip_thinking_tags(input1, keep_thinking=False)
-#     print("Test 1 - Remove thinking:")
-#     print(result_no_thinking)
-#     print("\n" + "="*80 + "\n")
-#
-#     result_keep_thinking = strip_thinking_tags(input1, keep_thinking=True)
-#     print("Test 1 - Keep thinking:")
-#     print(result_keep_thinking)
-#     print("\n" + "="*80 + "\n")
-#
-#     # Test 2: Multiple tag types
-#     input2 = """<thinking>Let me analyze this question...</thinking>
-#
-# <reasoning>Based on the data, I conclude...</reasoning>
-#
-# Here is the final answer: 42
-#
-# <context>Additional information from search results</context>"""
-#
-#     result2_no = strip_thinking_tags(input2, keep_thinking=False)
-#     print("Test 2 - Remove all tags:")
-#     print(result2_no)
-#     print("\n" + "="*80 + "\n")
-#
-#     result2_keep = strip_thinking_tags(input2, keep_thinking=True)
-#     print("Test 2 - Keep and format tags:")
-#     print(result2_keep)
-#     print("\n" + "="*80 + "\n")
-#
-#     # Test 3: No thinking tags
-#     input3 = "This is a normal response without any thinking tags."
-#     result3 = strip_thinking_tags(input3, keep_thinking=False)
-#     print("Test 3 - No tags:")
-#     print(result3)
-#     print("\n" + "="*80 + "\n")
-#
-#     print("All tests completed!")
-#
-# # Uncomment to run tests:
-# # test_strip_thinking_tags()
