@@ -1655,12 +1655,23 @@ def _searxng_search_sync(query: str) -> list:
             timeout=10,
         )
         r.raise_for_status()
+        payload = r.json()
         snippets = []
-        for item in r.json().get("results", [])[:MAX_SEARCH_RESULTS]:
+        for item in payload.get("results", [])[:MAX_SEARCH_RESULTS]:
             title = item.get("title", "").strip()
             content = item.get("content", "").strip()[:MAX_SNIPPET_LEN]
             if title and len(content) >= 15:
                 snippets.append(f"{title}: {content}")
+        if not snippets:
+            # 0 results usually means upstream engines are blocked/rate-limited,
+            # not that the query has no hits — surface SearXNG's own diagnostics.
+            unresponsive = payload.get("unresponsive_engines") or []
+            if unresponsive:
+                names = ", ".join(str(e[0]) for e in unresponsive if isinstance(e, (list, tuple)))
+                logger.warning(
+                    f"[Search] SearXNG unresponsive engines: {names} "
+                    "(instance is likely rate-limited/blocked by upstream engines)"
+                )
         logger.info(f"[Search] SearXNG '{query}' -> {len(snippets)} results")
         return snippets
     except Exception as e:
