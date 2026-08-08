@@ -10,7 +10,7 @@
 
 - 🔄 **6 AI Providers** — Groq, Gemini, OpenRouter, Cerebras, NVIDIA, and any Custom OpenAI-compatible endpoint
 - 🖼️ **Image OCR** — Send any photo and the bot extracts text or describes content via NVIDIA vision models
-- 🌐 **Web Search** — AI can search the web for real-time info (Brave API, SearXNG, or DuckDuckGo)
+- 🌐 **Web Search** — AI can search the web for real-time info (Exa, Brave API, SearXNG, or DuckDuckGo)
 - 💭 **Thinking Mode** — See AI reasoning traces with reasoning-capable models across all providers
 - 🧠 **Smart Memory** — Claude-style rolling compaction silently summarises old messages into structured long-term memory so the bot remembers across hundreds of turns (zero config, fully background)
 - ✅ **Model Validation** — Test which models actually work before using them
@@ -221,6 +221,11 @@ MAX_IMAGE_BYTES=15728640
 ### Web Search
 
 ```env
+# Exa search API key (get from https://dashboard.exa.ai/)
+# Returns a ready-to-read synthesized answer instead of raw snippets
+# (citations are kept in logs only, never shown in replies)
+EXA_API_KEY=your_exa_api_key
+
 # Brave Search API key (free: https://brave.com/search/api/)
 # If not set, Brave is used as default (falls back to DuckDuckGo if BRAVE_API_KEY is missing)
 BRAVE_API_KEY=your_brave_api_key
@@ -231,15 +236,21 @@ BRAVE_API_KEY=your_brave_api_key
 #   SEARXNG_URL=https://serxng-deployment-production.up.railway.app
 SEARXNG_URL=http://your-searxng-host
 
-# Engine: "brave", "searxng", or "duckduckgo" (default: brave)
-# Falls back to DuckDuckGo if BRAVE_API_KEY is not set
+# Engine: "exa", "brave", "searxng", or "duckduckgo" (default: brave)
+# Falls back to DuckDuckGo if the configured engine is missing its key/URL
 SEARCH_ENGINE=brave
 
 # Number of results to fetch (default: 5)
 MAX_SEARCH_RESULTS=5
 
-# Max snippet length per result (default: 300)
-MAX_SNIPPET_LEN=300
+# Max snippet length per result (default: 500)
+MAX_SNIPPET_LEN=500
+
+# Max length of Exa's synthesized answer passed to the model (default: 2000)
+MAX_ANSWER_LEN=2000
+
+# Exa API timeout in seconds — answer generation is slower than snippet search (default: 25)
+EXA_TIMEOUT=25
 ```
 
 ### Smart Memory tuning (advanced, optional)
@@ -286,6 +297,7 @@ COMPACT_MAX_TOKENS=1500
 | `/web` | Show current web search status and engine |
 | `/web on` | Enable web search |
 | `/web off` | Disable web search |
+| `/web exa` | Switch to Exa (synthesized answers, slower but higher quality) |
 | `/web brave` | Switch to Brave Search API |
 | `/web searxng` | Switch to SearXNG (self-hosted) |
 | `/web ddg` | Switch to DuckDuckGo (free, no key) |
@@ -520,12 +532,11 @@ The API call is retried up to 2 times on transient errors (rate limits, timeouts
 ## 🌐 How Web Search Works
 
 1. **You ask a question** — e.g., "What's the latest iPhone?"
-2. **Bot evaluates search need** — using a lightweight keyword/time heuristic
-3. **If needed, bot searches directly** — Using Brave API, SearXNG, or DuckDuckGo
-4. **Bot sends your question + snippets to AI** — in one answer pass
-5. **AI returns an up-to-date response** — grounded in the fetched snippets
+2. **The AI decides whether to search** — via function calling, the model autonomously invokes the `web_search` tool when it needs real-time info
+3. **Bot searches and feeds results back** — using Exa, Brave API, SearXNG, or DuckDuckGo
+4. **AI returns an up-to-date response** — grounded in the fetched search data, in a second call
 
-You can use `/web off` to disable this entirely, `/web searxng` to use your self-hosted SearXNG instance, or `/web ddg` to use the free DuckDuckGo engine without any API key. Brave is the default engine for best result quality.
+You can use `/web off` to disable this entirely, `/web searxng` to use your self-hosted SearXNG instance, or `/web ddg` to use the free DuckDuckGo engine without any API key. Brave is the default engine; `/web exa` switches to Exa, which returns a synthesized, ready-to-read answer instead of raw snippets (a bit slower per query, but noticeably better results).
 
 ---
 
@@ -601,6 +612,7 @@ You don't need to set any env vars for this feature. If you want to tune it, see
 
 ### Web search not working
 - Check if web search is enabled: `/web`
+- For Exa: ensure `EXA_API_KEY` is set — also note Exa requests take a few seconds longer since it generates a full answer
 - For Brave: ensure `BRAVE_API_KEY` is set
 - For SearXNG: ensure `SEARXNG_URL` is set and the instance has JSON format enabled. A free public instance is available at `https://serxng-deployment-production.up.railway.app` (provided by LiteLLM)
 - Try DuckDuckGo (no key needed): `/web ddg`
@@ -655,7 +667,8 @@ Built with:
 - [NVIDIA](https://build.nvidia.com/)
 - [Vercel AI Gateway](https://vercel.com/docs/ai-gateway)
 - [Brave Search](https://brave.com/search/api/)
-- [OpenAI Python SDK](https://github.com/openai/openai-python) — used by OpenRouter, NVIDIA, Vercel, and Custom providers
+- [Exa](https://exa.ai/) — answer-first web search API
+- [OpenAI Python SDK](https://github.com/openai/openai-python) — used by OpenRouter, NVIDIA, Gemini, Vercel, and Custom providers (plus the Exa search client)
 
 ---
 

@@ -85,6 +85,7 @@ MAX_INPUT_LENGTH = 4000
 # Web Search Configuration
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")
+EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "brave").lower()
 try:
     MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
@@ -94,6 +95,14 @@ try:
     MAX_SNIPPET_LEN = int(os.getenv("MAX_SNIPPET_LEN", "500"))
 except ValueError:
     MAX_SNIPPET_LEN = 500
+try:
+    MAX_ANSWER_LEN = int(os.getenv("MAX_ANSWER_LEN", "2000"))
+except ValueError:
+    MAX_ANSWER_LEN = 2000
+try:
+    EXA_TIMEOUT = float(os.getenv("EXA_TIMEOUT", "25"))
+except ValueError:
+    EXA_TIMEOUT = 25.0
 
 # Provider API Keys
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -726,30 +735,19 @@ def _parse_openai_tool_calls(response) -> List[Dict]:
             arguments = json.loads(tc.function.arguments or "{}")
         except (json.JSONDecodeError, AttributeError):
             arguments = {}
-        calls.append({
+        call = {
             "id": getattr(tc, "id", None) or "call_0",
             "name": tc.function.name,
             "arguments": arguments,
-        })
+        }
+        # Keep the full raw tool_call (e.g. Gemini's extra_content.thought_signature)
+        # so Call 2 can replay the assistant turn verbatim — some endpoints 400 without it.
+        try:
+            call["raw"] = tc.model_dump(exclude_none=True)
+        except AttributeError:
+            pass
+        calls.append(call)
     return calls
-
-
-def _openai_tool_result_message(tool_call: Dict, result_text: str) -> Dict:
-    """Build the tool result message for OpenAI-compatible providers."""
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call["id"],
-        "content": result_text,
-    }
-
-
-def _openai_assistant_tool_call_message(tool_calls_raw) -> Dict:
-    """Reconstruct the assistant message that requested tool calls (for multi-turn)."""
-    return {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": tool_calls_raw,
-    }
 
 
 class GroqProvider(AIProvider):
@@ -831,112 +829,6 @@ class GroqProvider(AIProvider):
         reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1"]
         return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
-
-class GeminiProvider(AIProvider):
-    """Gemini via its native SDK.
-
-    The native SDK does not expose an easy OpenAI-compatible tool_calls flow,
-    so we fall back to system-prompt-based search context injection for this
-    provider.  Function calling is handled at the OpenAI-compat layer if the
-    user switches to Gemini via OpenRouter or a custom endpoint instead.
-    """
-
-    def __init__(self, api_key: str):
-        super().__init__()
-        import google.generativeai as genai
-
-        genai.configure(api_key=api_key)
-        self.genai = genai
-        self.default_model = "gemini-flash-lite-latest"
-
-    def supports_function_calling(self) -> bool:
-        # Native SDK path does not use our OpenAI tool-call format
-        return False
-
-    def chat(
-        self,
-        messages: List[Dict],
-        model: Optional[str] = None,
-        enable_thinking: bool = False,
-        max_tokens: Optional[int] = None,
-        tools: Optional[list] = None,
-    ) -> ChatResult:
-        if not messages:
-            raise ValueError("Messages list cannot be empty")
-        model_name = model or self.default_model
-        system_msg = next(
-            (m["content"] for m in messages if m["role"] == "system"), SYSTEM_PROMPT
-        )
-        gen_model = self.genai.GenerativeModel(
-            model_name,
-            generation_config={
-                "temperature": TEMPERATURE,
-                "max_output_tokens": max_tokens or MAX_TOKENS,
-            },
-            system_instruction=system_msg,
-        )
-        chat_history = []
-        for msg in messages[:-1]:
-            if msg["role"] == "system":
-                continue
-            # Skip tool result messages — not native-SDK-compatible
-            if msg.get("role") == "tool":
-                continue
-            role = "user" if msg["role"] == "user" else "model"
-            content = msg.get("content") or ""
-            if content:
-                chat_history.append({"role": role, "parts": [content]})
-
-        last_content = messages[-1].get("content") or ""
-        chat = gen_model.start_chat(history=chat_history)
-        response_text = chat.send_message(last_content).text if last_content else ""
-        return ChatResult(
-            content=strip_thinking_tags(response_text, keep_thinking=enable_thinking),
-            tool_calls=[],
-        )
-
-    def get_available_models(self) -> List[Dict[str, str]]:
-        with self._models_lock:
-            if self._cached_models is not None:
-                return self._cached_models
-            try:
-                chat_models = []
-                for model in self.genai.list_models():
-                    if "generateContent" not in model.supported_generation_methods:
-                        continue
-                    model_id = model.name.replace("models/", "")
-                    if any(
-                        x in model_id.lower() for x in ["vision", "embedding", "aqa"]
-                    ):
-                        continue
-                    name = (
-                        model.display_name
-                        if hasattr(model, "display_name")
-                        else model_id.replace("-", " ").title()
-                    )
-                    chat_models.append({"id": model_id, "name": name})
-                chat_models.sort(key=lambda m: get_model_capability_score(m["id"]))
-                self._cached_models = chat_models
-                logger.info(f"✅ Gemini: Detected {len(chat_models)} available models")
-                return chat_models
-            except Exception as e:
-                logger.warning(f"⚠️ Gemini: Could not fetch models: {e}")
-                return self._get_fallback_models()
-
-    def _get_fallback_models(self) -> List[Dict[str, str]]:
-        return [
-            {"id": "gemini-flash-lite-latest", "name": "Gemini Flash Lite (Latest)"},
-            {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash"},
-            {"id": "gemini-1.5-flash", "name": "Gemini 1.5 Flash"},
-            {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro"},
-            {"id": "gemini-2.0-flash-exp", "name": "Gemini 2.0 Flash Experimental"},
-        ]
-
-    def get_name(self) -> str:
-        return "Gemini"
-
-    def get_default_model(self) -> str:
-        return self.default_model
 
     def supports_thinking(self, model_id: str) -> bool:
         reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1", "gemini-2"]
@@ -1332,12 +1224,12 @@ class CustomProvider(AIProvider):
                     chat_models.sort(key=lambda m: get_model_capability_score(m["id"]))
                     self._cached_models = chat_models
                     logger.info(
-                        f"✅ Custom: Detected {len(chat_models)} available models"
+                        f"✅ {self.get_name()}: Detected {len(chat_models)} available models"
                     )
                     return self._cached_models
             except Exception as e:
                 logger.warning(
-                    f"⚠️ Custom: Could not fetch model list from {self.base_url}: {e}"
+                    f"⚠️ {self.get_name()}: Could not fetch model list from {self.base_url}: {e}"
                 )
             self._cached_models = [
                 {
@@ -1345,7 +1237,7 @@ class CustomProvider(AIProvider):
                     "name": self.default_model.replace("-", " ").title(),
                 }
             ]
-            logger.info("✅ Custom: Using configured default model as fallback")
+            logger.info(f"✅ {self.get_name()}: Using configured default model as fallback")
             return self._cached_models
 
     def get_name(self) -> str:
@@ -1370,6 +1262,47 @@ class VercelProvider(CustomProvider):
         # Default gateway model (Perplexity Sonar) emits no thinking tags;
         # CustomProvider returns True unconditionally, which would be misleading.
         return False
+
+
+class GeminiProvider(CustomProvider):
+    """Gemini via its OpenAI-compatible endpoint instead of the native SDK.
+
+    This unlocks the function-calling search flow for GEMINI_API_KEY users.
+    Caveat: Gemini thinking models sign tool calls — the response carries
+    extra_content.thought_signature which must be replayed verbatim in the
+    follow-up request, or the endpoint 400s. Handled by the raw tool_call
+    round-trip in _parse_openai_tool_calls / _chat_with_function_calling.
+    """
+
+    BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    def __init__(self, api_key: str):
+        super().__init__(
+            api_key=api_key,
+            base_url=self.BASE_URL,
+            default_model="gemini-flash-lite-latest",
+        )
+
+    def get_name(self) -> str:
+        return "Gemini"
+
+    def supports_thinking(self, model_id: str) -> bool:
+        # Gemini's thinking happens server-side; no tags in content to reveal
+        return False
+
+    def get_available_models(self) -> List[Dict[str, str]]:
+        models = super().get_available_models()
+        # Google's endpoint prefixes IDs ("models/gemini-2.5-flash") — strip it,
+        # otherwise switching model via /model sends an ID the chat endpoint rejects
+        for m in models:
+            if m["id"].startswith("models/"):
+                m["id"] = m["id"][len("models/"):]
+                m["name"] = m["id"].replace("-", " ").title()
+        non_chat = ("embedding", "imagen", "tts", "aqa", "vision", "gemma")
+        filtered = [
+            m for m in models if not any(b in m["id"].lower() for b in non_chat)
+        ]
+        return filtered or models
 
 
 # ============================================================================
@@ -1471,7 +1404,9 @@ def get_user_session(user_id: str) -> Dict:
     now = time.time()
 
     if user_id not in user_sessions:
-        if SEARCH_ENGINE == "searxng" and SEARXNG_URL:
+        if SEARCH_ENGINE == "exa" and EXA_API_KEY:
+            default_engine = "exa"
+        elif SEARCH_ENGINE == "searxng" and SEARXNG_URL:
             default_engine = "searxng"
         elif SEARCH_ENGINE == "brave" and BRAVE_API_KEY:
             default_engine = "brave"
@@ -1679,7 +1614,78 @@ def _searxng_search_sync(query: str) -> list:
         return []
 
 
+_exa_client = None
+_exa_client_lock = threading.Lock()
+
+
+def _get_exa_client():
+    """Lazily build one shared Exa OpenAI-compatible client (avoids re-init per query)."""
+    global _exa_client
+    if _exa_client is None:
+        with _exa_client_lock:
+            if _exa_client is None:
+                from openai import OpenAI
+
+                _exa_client = OpenAI(
+                    base_url="https://api.exa.ai",
+                    api_key=EXA_API_KEY,
+                    timeout=EXA_TIMEOUT,
+                )
+    return _exa_client
+
+
+def _exa_search_sync(query: str) -> list:
+    """Exa answer endpoint: returns a synthesized, ready-to-read answer.
+
+    Output shape matches the other engines (list of strings) but contains a
+    single clean answer the chat model can paraphrase directly. Citation
+    markers are stripped and sources go to the log only — feeding sources to
+    the model makes it echo citations into Telegram replies, where they
+    render poorly.
+    """
+    if not EXA_API_KEY:
+        return []
+    try:
+        r = _get_exa_client().chat.completions.create(
+            model="exa",
+            messages=[{"role": "user", "content": query}],
+        )
+        answer = ""
+        citations = []
+        if r.choices:
+            msg = r.choices[0].message
+            answer = (msg.content or "").strip()
+            # Non-standard field Exa attaches to the message (list of dicts)
+            citations = [
+                c
+                for c in (getattr(msg, "citations", None) or [])
+                if isinstance(c, dict)
+            ]
+        if not answer:
+            return []
+        # Strip inline [1][2] citation markers — the source list is not sent
+        # to the model, so the markers would dangle.
+        answer = re.sub(r"\s*(?:\[\d+\])+", "", answer)
+        logger.info(
+            f"[Search] Exa '{query}' -> answer ({len(answer)} chars), "
+            f"{len(citations)} sources logged"
+        )
+        for c in citations:
+            logger.debug(f"[Search] Exa source: {c.get('title')} — {c.get('url')}")
+        return [answer[:MAX_ANSWER_LEN]]
+    except Exception as e:
+        logger.error(f"[Search] Exa error: {e}")
+        return []
+
+
 async def web_search(query: str, engine: str) -> list:
+    if engine == "exa" and EXA_API_KEY:
+        results = await asyncio.to_thread(_exa_search_sync, query)
+        if results:
+            return results
+        logger.warning(
+            f"[Search] Exa returned no results for '{query}' — falling back to DuckDuckGo"
+        )
     if engine == "searxng" and SEARXNG_URL:
         results = await asyncio.to_thread(_searxng_search_sync, query)
         if results:
@@ -1722,10 +1728,12 @@ def _format_search_results(query: str, snippets: list) -> str:
 #   Call 2 — follow-up with tool result in messages:
 #     • Model answers using search data  → done
 #
-# FALLBACK (providers without function calling, e.g. Gemini native SDK):
+# FALLBACK (any provider with supports_function_calling() == False):
 #   Same as before: single direct AI call. The system prompt already instructs
 #   the model to mention if it's uncertain; the user can enable /web on to
 #   append search results via a manual query when needed.
+#   (All built-in providers currently support function calling — this path is
+#   defensive, and Gemini joins them via its OpenAI-compatible endpoint.)
 #
 # ============================================================================
 
@@ -1816,9 +1824,15 @@ async def _chat_with_function_calling(
     # the assistant message (with the tool_calls list) and then the tool result.
     follow_up_messages = list(messages)
 
-    # Rebuild the raw tool_calls structure the SDK expects
+    # Rebuild the tool_calls structure the API expects. Prefer the raw dump
+    # captured at parse time — Gemini's OpenAI-compat endpoint signs its
+    # function calls (extra_content.thought_signature) and 400s on Call 2
+    # if the signature is missing.
     raw_tool_calls = []
     for tc in chat_result.tool_calls:
+        if isinstance(tc.get("raw"), dict):
+            raw_tool_calls.append(tc["raw"])
+            continue
         raw_tool_calls.append({
             "id": tc.get("id") or "call_0",
             "type": "function",
@@ -2304,6 +2318,7 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "ON" if session.get("web_search") else "OFF"
         eng = session.get("search_engine", "duckduckgo")
         eng_label = {
+            "exa": "Exa (answer API)",
             "brave": "Brave API",
             "searxng": "SearXNG",
             "duckduckgo": "DuckDuckGo",
@@ -2313,6 +2328,11 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if provider.supports_function_calling()
             else "⚠️ Provider has no function calling — search unavailable for this provider."
         )
+        exa_line = (
+            "`/web exa` — Exa (synthesized answers, slower but higher quality)\n"
+            if EXA_API_KEY
+            else ""
+        )
         searxng_line = (
             "`/web searxng` — SearXNG (self-hosted)\n" if SEARXNG_URL else ""
         )
@@ -2321,6 +2341,7 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔍 *Engine:* {eng_label}\n"
             f"⚙️ {fc_note}\n\n"
             f"Use: `/web on` | `/web off`\n"
+            f"{exa_line}"
             f"`/web brave` — Brave Search API\n"
             f"{searxng_line}"
             f"`/web ddg` — DuckDuckGo (free)",
@@ -2332,6 +2353,7 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["web_search"] = True
         eng = session.get("search_engine", "duckduckgo")
         eng_label = {
+            "exa": "Exa",
             "brave": "Brave",
             "searxng": "SearXNG",
             "duckduckgo": "DuckDuckGo",
@@ -2340,6 +2362,18 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif arg == "off":
         session["web_search"] = False
         await update.message.reply_text("🔕 Web search disabled.")
+    elif arg == "exa":
+        if not EXA_API_KEY:
+            await update.message.reply_text(
+                "❌ EXA_API_KEY not configured. Use `/web ddg`.",
+                parse_mode="Markdown",
+            )
+        else:
+            session["search_engine"] = "exa"
+            session["web_search"] = True
+            await update.message.reply_text(
+                "✅ Switched to Exa (synthesized answers — a bit slower, higher quality)."
+            )
     elif arg == "brave":
         if not BRAVE_API_KEY:
             await update.message.reply_text(
@@ -2365,7 +2399,7 @@ async def web_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Switched to SearXNG.")
     else:
         await update.message.reply_text(
-            "❌ Use: `/web on|off|brave|searxng|ddg`", parse_mode="Markdown"
+            "❌ Use: `/web on|off|exa|brave|searxng|ddg`", parse_mode="Markdown"
         )
 
 
@@ -2384,6 +2418,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     web_on = session.get("web_search", True)
     engine = session.get("search_engine", "duckduckgo")
     engine_label = {
+        "exa": "Exa",
         "brave": "Brave",
         "searxng": "SearXNG",
         "duckduckgo": "DuckDuckGo",
