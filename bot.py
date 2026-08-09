@@ -751,11 +751,20 @@ def _parse_openai_tool_calls(response) -> List[Dict]:
 
 
 class GroqProvider(AIProvider):
+    """Groq via its OpenAI-compatible endpoint (chat completions dialect).
+
+    Uses the same OpenAI SDK as the other providers — no dedicated groq
+    package needed. Model listing is override-specific: the OpenAI-compat
+    models endpoint exposes the same `active` flag as the native one.
+    """
+
     def __init__(self, api_key: str):
         super().__init__()
-        from groq import Groq
+        from openai import OpenAI
 
-        self.client = Groq(api_key=api_key)
+        self.client = OpenAI(
+            api_key=api_key, base_url="https://api.groq.com/openai/v1"
+        )
         self.default_model = "openai/gpt-oss-120b"
 
     def supports_function_calling(self) -> bool:
