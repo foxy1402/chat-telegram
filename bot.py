@@ -962,11 +962,13 @@ class OpenRouterProvider(AIProvider):
 
 
 class CerebrasProvider(AIProvider):
+    """Cerebras via its OpenAI-compatible endpoint — no dedicated SDK needed."""
+
     def __init__(self, api_key: str):
         super().__init__()
-        from cerebras.cloud.sdk import Cerebras
+        from openai import OpenAI
 
-        self.client = Cerebras(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, base_url="https://api.cerebras.ai/v1")
         self.default_model = "llama3.1-8b"
 
     def supports_function_calling(self) -> bool:
