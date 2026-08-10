@@ -2,30 +2,53 @@
 ESP32-C3 Super Mini — MicroPython Telegram Bot
 ================================================
 Multi-provider AI chat bot (Groq, Gemini, OpenRouter, Cerebras, NVIDIA)
-with DuckDNS updater and WiFi retry loop.
+with LLM function-calling web search, DuckDNS updater and WiFi retry loop.
 
 Hardware: ESP32-C3 Super Mini (400 KB SRAM, 4 MB flash)
 Runtime:  MicroPython 1.20+
 
 ZERO DISK WRITES — all state is in-memory, reboot resets everything.
+TIP: flash as .mpy (mpy-cross) to skip on-device compilation — saves RAM.
 
-CHANGES v3 → v4 (AI-routed search — keyword heuristics removed):
-  - REMOVED all keyword heuristics (_KW_TIME, _KW_TOPIC, _KW_NO_SEARCH,
-    _KW_COMPARE) and _search_tier() / _extract_search_query() functions.
-    Root cause: substring matching was brittle — "playlist" hit "list",
-    "barcode" hit "code", "today's code review" falsely triggered search.
-  - NEW: AI-routed 2-step flow. Every non-trivial message gets a lightweight
-    AI decision call (max_tokens=60, temperature=0) that returns either
-    SEARCH: <optimized query> or NOSEARCH. The AI crafts better search
-    queries than client-side prefix stripping ever could.
-  - Quick filter: greetings and very short messages (<6 chars) skip the
-    decision call entirely — 1 AI call, no overhead.
-  - Answers ALWAYS come from the full system prompt, never from the
-    decision prompt. Consistent quality whether or not search triggers.
-  - _parse_search_query() retained for robust parsing of AI decision output.
-  - Cost: +1 lightweight API call per non-trivial message.
-  - Prior v3 fixes retained: WDT feeding, typing indicators, empty response
-    fallback, history rollback on error.
+CHANGES v4 → v5 (architecture ported from full-size bot.py):
+  - Search routing is now NATIVE FUNCTION CALLING (OpenAI tools schema),
+    not a separate SEARCH/NOSEARCH decision call. Removed ai_decide_search(),
+    _parse_search_query() and all greeting/keyword heuristics (~150 lines).
+    Normal chat = 1 API call. Search = 2 calls (tool_call → result → answer).
+  - Raw tool_calls dict is echoed back verbatim in the follow-up call —
+    Gemini's OpenAI-compat endpoint signs function calls and 400s otherwise.
+  - Transient-error retry (429/5xx/timeout keywords) with backoff, from bot.py.
+  - <think>/<reasoning> tag stripping for reasoning models (pure string ops,
+    no ure import).
+  - System prompt carries the tool-usage policy + per-request date injection.
+  - SearXNG added as an engine option (JSON API — lighter than DDG HTML).
+
+  CHANGES v5 → v6 (parity with current bot.py):
+  - Exa search engine: one small HTTPS POST returns a synthesized answer —
+    replaces 'scrape ~20 KB HTML + feed raw snippets', so it is BOTH higher
+    quality AND smaller peak heap. Default engine when EXA_API_KEY is set.
+  - Provider defaults/fallbacks refreshed to match bot.py; Vercel and a
+    user-filled Custom OpenAI-compatible endpoint added.
+  - /web exa command; Exa-aware default-engine picker; /model empty-list guard.
+  - Rolling summary memory (bot.py smart-compaction, C3-tuned): when the
+    6-message window overflows, the oldest turns are compressed by one extra
+    LLM call into session["summary"] (~400 chars) and injected ahead of the
+    last 2 verbatim messages on every following chat call. Falls back to
+    plain trim when free heap < COMPACT_MIN_FREE so a tight chip never OOMs.
+
+  ESP32-C3 RAM fixes (400 KB SRAM):
+  - getUpdates: limit=5 + allowed_updates filter. The default (up to 100
+    updates) could deliver >100 KB JSON and OOM the heap instantly.
+  - Boot-time offset flush (offset=-1) — a WDT reboot no longer re-answers
+    the old message backlog.
+  - DuckDuckGo moved html/ → lite/ endpoint with a 20 KB capped read
+    (the full page is 60-100 KB).
+  - Model lists are NOT fetched at boot — fallback lists are seeded instantly,
+    real fetch happens only on /models or /refresh.
+  - History clipped to 1200 chars/message when stored.
+  - Emergency session-eviction floor raised 20 KB → 40 KB (one TLS handshake
+    needs ~30-40 KB headroom).
+  - Typing-indicator calls cut 4 → 2 per message (each one is a full TLS POST).
 """
 
 import network
@@ -33,6 +56,7 @@ import urequests
 import ujson
 import time
 import gc
+import ntptime
 from machine import WDT, reset, freq
 
 # ============================================================================
@@ -47,17 +71,26 @@ ALLOWED_USER_IDS = []   # e.g. [123456789] — empty = allow all
 
 DUCKDNS_TOKEN    = "YOUR_DUCKDNS_TOKEN"
 DUCKDNS_DOMAIN   = "YOUR_SUBDOMAIN"
-DUCKDNS_INTERVAL = 300
+DUCKDNS_INTERVAL = 900   # DuckDNS accepts 15 min fine — halves per-hour TLS handshakes
 
 GROQ_API_KEY       = ""
 GEMINI_API_KEY     = ""
 OPENROUTER_API_KEY = ""
 CEREBRAS_API_KEY   = ""
 NVIDIA_API_KEY     = ""
+VERCEL_API_KEY     = ""
 
 BRAVE_API_KEY      = ""
+SEARXNG_URL        = ""     # e.g. "http://192.168.1.10:8080" — no trailing slash
+EXA_API_KEY        = ""     # https://dashboard.exa.ai/ — synthesized answer via HTTPS, lighter than scraping
 MAX_SEARCH_RESULTS = 3
 MAX_SNIPPET_LEN    = 200
+MAX_ANSWER_LEN     = 1200   # cap on Exa's synthesized answer fed to the model
+
+# ── Custom OpenAI-compatible endpoint (fill these three to enable) ──────────
+CUSTOM_API_KEY       = ""
+CUSTOM_BASE_URL      = ""   # e.g. "https://api.example.com" — "/v1/chat/completions" is appended
+CUSTOM_DEFAULT_MODEL = ""
 
 DEFAULT_PROVIDER = "groq"
 MAX_TOKENS       = 512
@@ -65,166 +98,136 @@ TEMPERATURE      = 0.7
 MAX_HISTORY      = 6
 MAX_SESSIONS     = 3
 MAX_RESPONSE_LEN = 4000
+HISTORY_MSG_MAX  = 1200   # per-message clip when stored in history
 RATE_LIMIT_SECS  = 2
+MEM_FLOOR        = 40000  # one TLS handshake needs ~30-40 KB free
+
+_DEBUG = True  # False for production flash — suppresses print() string allocs
+
+# ── SMART COMPACTION (rolling summary memory, C3-tuned) ─────────────────────
+# When the history window overflows, the oldest turns are summarized by one
+# extra LLM call into session["summary"] instead of being dropped. The chat
+# call then receives summary + last COMPACT_KEEP_RECENT messages.
+# Budgets are ~10x leaner than bot.py (400 chars ≈ 100 tokens) — remember
+# durable facts, not conversation texture.
+COMPACT_THRESHOLD   = MAX_HISTORY  # compact when history would exceed this
+COMPACT_KEEP_RECENT = 2            # verbatim messages kept after compaction
+MAX_SUMMARY_CHARS   = 400
+COMPACT_MAX_TOKENS  = 180
+# Skip compaction (fall back to plain trim) unless this much heap is free —
+# the extra request must not cannibalize the chat call that follows.
+COMPACT_MIN_FREE    = 80000
 
 # ============================================================================
-# SYSTEM PROMPTS
-#
-# SYSTEM_PROMPT              — normal AI calls
-# SYSTEM_PROMPT_WITH_RESULTS — when search results are passed in
-# _make_search_decision_prompt() — builds AI search-routing prompt with
-#                                  today's date injected at call time
+# SYSTEM PROMPT — ported from bot.py, tool-usage policy included.
+# {date} is replaced per-request. No separate search router prompt exists
+# anymore: the model routes itself via function calling.
 # ============================================================================
 
 _PROMPT_BASE = (
     "You are a helpful, concise AI assistant running on an ESP32 microcontroller "
     "and speaking through Telegram.\n\n"
-    "FORMATTING RULES:\n"
-    "- Telegram Markdown only: *bold*, _italic_, `code`, ```blocks```\n"
+    "FORMATTING RULES — follow strictly:\n"
+    "- Use plain Telegram Markdown only: *bold*, _italic_, `code`, ```code blocks```\n"
     "- Never use ## headers — they do not render in Telegram\n"
-    "- Never use LaTeX. Flat bullet lists only (- item)\n"
-    "- Keep responses concise. No long preambles or sign-offs\n"
+    "- Never use LaTeX math notation\n"
+    "- Use flat bullet lists (- item). Never nest lists\n"
+    "- Keep responses concise. Avoid long preambles and sign-offs\n"
     "- For comparisons: use *bold item name* on its own line, then bullet points for attributes. "
     "Never use | pipe | tables — they do not render in Telegram\n\n"
-    "BEHAVIOUR:\n"
-    "- Be direct and practical\n"
-    "- Admit uncertainty rather than guessing\n"
-    "- Use fenced code blocks with language name for all code"
+    "BEHAVIOUR (in priority order — earlier wins):\n"
+    "1. If you're not sure, say so explicitly and early. It is ALWAYS better to say "
+    "'I don't know' than to state something wrong with confidence.\n"
+    "2. Be direct and practical\n"
+    "3. When code is requested, use fenced code blocks with the language name\n\n"
+    "WEB SEARCH TOOL:\n"
+    "You have access to a `web_search` tool. Call it automatically whenever the user's "
+    "question requires current, real-time, or time-sensitive information such as: "
+    "news, prices, sports scores, weather, product availability, recent events, "
+    "people's current status, or any fact you are not fully confident about. "
+    "Do NOT call the tool for: coding help, math, creative writing, definitions, "
+    "greetings, opinions, or general knowledge you can answer confidently. "
+    "When search results are provided to you, base your answer ONLY on those results. "
+    "Do NOT use your training data to fill in facts absent from the results — "
+    "if the results lack enough info, say so clearly. "
+    "If the search returns no usable results at all, say plainly 'I couldn't find "
+    "current information on that' and stop — do not fall back to memory. "
+    "Today's date is {date}."
 )
 
-_PROMPT_SEARCH_DECISION = (
-    "You are a search router. Decide if the user's latest message needs a "
-    "live web search to answer accurately. Today's date is {date}.\n\n"
-    "Respond with EXACTLY one line:\n"
-    "  SEARCH: <2-6 word query>   — needs current/real-time info\n"
-    "  NOSEARCH                   — can answer from training knowledge\n\n"
-    "Use SEARCH for: current events, live prices, weather, sports scores, "
-    "recent news, product info, real-time data, people's current status, "
-    "or any fact you are NOT confident about.\n\n"
-    "Use NOSEARCH for: coding help, math, creative writing, definitions, "
-    "explanations, greetings, opinions, general knowledge, or anything "
-    "you can confidently answer from training data.\n\n"
-    "CRITICAL: Output ONLY one line. No explanations. No apologies. "
-    "No extra text after SEARCH: query. Just the decision."
-)
 
-_PROMPT_SEARCH_RESULTS = (
-    "\n\nSEARCH RESULTS FORMAT:\n"
-    "Results appear as numbered snippets (1. Title: text). "
-    "Use them to answer accurately. Refer to sources naturally "
-    "(e.g. 'according to X'). Do NOT write citation numbers like [1][2]."
-)
-
-SYSTEM_PROMPT              = _PROMPT_BASE
-SYSTEM_PROMPT_WITH_RESULTS = _PROMPT_BASE + _PROMPT_SEARCH_RESULTS
+def _log(*args):
+    """Debug print — compiled out on production flashes (_DEBUG=False)."""
+    if _DEBUG:
+        print(*args)
 
 
-def _make_search_decision_prompt():
+_prompt_cache = {"date": None, "text": None}
+
+def _build_system_prompt():
+    """Daily-cached: rebuilding the 1.3 KB prompt per message was ~1.3 KB of
+    string churn on every chat call. Only the {date} substitution varies."""
     t = time.localtime()
-    today = "%04d-%02d-%02d" % (t[0], t[1], t[2])
-    return _PROMPT_SEARCH_DECISION.replace("{date}", today)
+    today = (t[0], t[1], t[2])
+    if _prompt_cache["date"] != today:
+        _prompt_cache["date"] = today
+        _prompt_cache["text"] = _PROMPT_BASE.replace("{date}", "%04d-%02d-%02d" % today)
+    return _prompt_cache["text"]
 
 
 # ============================================================================
-# SEARCH DECISION — QUICK FILTER
+# FUNCTION CALLING — WEB SEARCH TOOL DEFINITION (from bot.py)
 #
-# Greetings and very short messages skip the AI decision call entirely.
-# Everything else gets a lightweight AI call for SEARCH/NOSEARCH routing.
+# Passed to every provider via the OpenAI-compatible tools parameter.
+# The model decides autonomously whether to search; no router call needed.
 # ============================================================================
 
-_GREETINGS = (
-    'hi', 'hello', 'hey', 'hola', 'thanks', 'thank you', 'bye',
-    'ok', 'okay', 'yes', 'no', 'sure', 'lol', 'haha', 'nice',
-    'good morning', 'good night', 'good evening', 'good afternoon',
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the web for current, real-time, or time-sensitive information. "
+            "Call this when the user asks about recent news, live prices, sports scores, "
+            "weather, product availability, people's current status, recent events, "
+            "or any fact you are not fully confident about from training data. "
+            "Do NOT call for coding help, math, definitions, greetings, or stable general knowledge."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "A specific, self-contained web search query. "
+                        "Include the subject noun and, for time-sensitive topics, the current year. "
+                        "Aim for 4-8 words. Must be fully formed and searchable."
+                    ),
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+# ============================================================================
+# TRANSIENT API RETRY (from bot.py)
+# ============================================================================
+
+_TRANSIENT_ERRORS = (
+    "rate limit", "too many requests", "429", "timeout", "timed out",
+    "503", "502", "500", "529", "overloaded", "temporarily unavailable",
+    "service unavailable", "connection error", "connection reset",
 )
+_CHAT_MAX_RETRIES = 2
 
 
-def _skip_search_decision(text):
-    """True for messages that obviously don't need web search."""
-    if len(text) < 6:
-        return True
-    return text.lower().rstrip('!?.,: ') in _GREETINGS
-
-
-def _parse_search_query(response):
-    """Extract SEARCH: query from AI decision response.
-    Returns clean query string or None if AI answered directly.
-
-    Handles all known model quirks — pure string ops, no ure/re import:
-    - Doubled output (no newline):
-        'SEARCH: bitcoin priceSEARCH: bitcoin price'
-        Root cause: Cerebras doubles the entire line. Fix: cut at embedded 'search:'.
-    - Apology glued inline (no newline):
-        'SEARCH: current US presidentI am sorry, I cannot...'
-        Root cause: small models ignore 'ONLY this line' instruction.
-        Fix: scan for apology keywords, truncate at first match.
-    - Period-terminated with explanation:
-        'SEARCH: who is president. I cannot answer that.'
-        Fix: truncate at first '. ' / '! ' / '? ' (space-delimited to preserve decimals)
-    - Answer appended after newline:
-        'SEARCH: bitcoin price\n\nBitcoin is currently...'
-        Fix: split('\n')[0]
-    - Quoted query:     SEARCH: \"bitcoin price\"
-    - Repeated prefix:  SEARCH: SEARCH: something
-    - Mixed case:       search: / Search:
-    """
-    stripped = response.strip()
-    if not stripped.upper().startswith('SEARCH:'):
-        return None
-
-    raw = stripped[7:].strip()
-
-    # Take only the first line
-    nl = raw.find('\n')
-    if nl != -1:
-        raw = raw[:nl].strip()
-
-    # Strip surrounding quotes/backticks
-    if len(raw) > 2 and raw[0] in ('"', "'", '`') and raw[-1] == raw[0]:
-        raw = raw[1:-1].strip()
-
-    # Strip repeated SEARCH: prefix (rare but happens)
-    for _ in range(3):
-        if raw.upper().startswith('SEARCH:'):
-            raw = raw[7:].strip()
-        else:
-            break
-
-    # Cut at inline apology/refusal — models that ignore 'CRITICAL:' instruction
-    # still sometimes glue apology text directly after the query without a newline.
-    # Using pure str.find() — no ure import needed, saves ~2KB RAM on ESP32.
-    _CUTS = (
-        "search:",                                            # doubled output quirk
-        "nosearch",                                           # glued NOSEARCH suffix (Cerebras quirk)
-        "i\u2019m sorry", "i'm sorry", "i am sorry",         # Unicode + ASCII apostrophe variants
-        "i cannot", "i don\u2019t", "i don't", "i do not",
-        "i am unable", "i can\u2019t", "i can't",
-        "please note", "note that",
-        "however,", "unfortunately", "as of my",
-        "here is", "here are", "let me", "the answer", "to answer",
-    )
-    raw_lower = raw.lower()
-    cut_at = len(raw)
-    for pat in _CUTS:
-        idx = raw_lower.find(pat)
-        if idx != -1 and idx < cut_at:
-            cut_at = idx
-    raw = raw[:cut_at].strip()
-
-    # Cut at sentence boundary — catches 'who is president. I cannot answer.'
-    # Find the earliest . ! ? and truncate there
-    for punct in ('. ', '! ', '? '):
-        idx = raw.find(punct)
-        if idx != -1:
-            raw = raw[:idx].strip()
-            break
-
-    # Strip trailing punctuation and Markdown artifacts (* from bold markers)
-    raw = raw.rstrip('.,!?;:*`').strip()
-
-    raw = raw[:120]
-    # Require at least 2 chars — 1-char result means parsing failed, fall back
-    return raw if len(raw) >= 2 else None
+def _is_transient(err_msg):
+    low = err_msg.lower()
+    for kw in _TRANSIENT_ERRORS:
+        if kw in low:
+            return True
+    return False
 
 
 # ============================================================================
@@ -233,6 +236,8 @@ def _parse_search_query(response):
 
 PROVIDERS = {}
 
+# Defaults/fallbacks mirror the maintained bot.py. Cached "models" lists live
+# only in RAM — boot reseeds them, so edits here DO survive flashing (no cache file).
 if GROQ_API_KEY:
     PROVIDERS["groq"] = {
         "name": "Groq",
@@ -240,8 +245,8 @@ if GROQ_API_KEY:
         "models_url": "https://api.groq.com/openai/v1/models",
         "can_fetch": True,
         "key": GROQ_API_KEY,
-        "default_model": "llama-3.3-70b-versatile",
-        "fallback": ["llama-3.3-70b-versatile","llama-3.1-8b-instant","mixtral-8x7b-32768","gemma2-9b-it"],
+        "default_model": "openai/gpt-oss-120b",
+        "fallback": ["openai/gpt-oss-120b","llama-3.3-70b-versatile","llama-3.1-8b-instant","openai/gpt-oss-20b"],
         "models": [],
     }
 
@@ -252,8 +257,8 @@ if GEMINI_API_KEY:
         "models_url": "https://generativelanguage.googleapis.com/v1beta/openai/models",
         "can_fetch": True,
         "key": GEMINI_API_KEY,
-        "default_model": "gemini-2.0-flash",
-        "fallback": ["gemini-2.0-flash","gemini-2.0-flash-lite","gemini-1.5-flash","gemini-1.5-pro"],
+        "default_model": "gemini-flash-lite-latest",
+        "fallback": ["gemini-flash-lite-latest","gemini-2.5-flash","gemini-2.5-pro"],
         "models": [],
     }
 
@@ -264,10 +269,10 @@ if OPENROUTER_API_KEY:
         "models_url": "",
         "can_fetch": False,
         "key": OPENROUTER_API_KEY,
-        "default_model": "meta-llama/llama-3.3-70b-instruct:free",
+        "default_model": "openrouter/free",
         "fallback": [
+            "openrouter/free",
             "meta-llama/llama-3.3-70b-instruct:free",
-            "nousresearch/hermes-3-llama-3.1-405b:free",
             "qwen/qwen-2.5-72b-instruct:free",
             "mistralai/mistral-7b-instruct:free",
         ],
@@ -281,8 +286,8 @@ if CEREBRAS_API_KEY:
         "models_url": "https://api.cerebras.ai/v1/models",
         "can_fetch": True,
         "key": CEREBRAS_API_KEY,
-        "default_model": "llama-3.3-70b",
-        "fallback": ["llama-3.3-70b","llama3.1-8b"],
+        "default_model": "llama3.1-8b",
+        "fallback": ["llama3.1-8b","gpt-oss-120b","llama-3.3-70b"],
         "models": [],
     }
 
@@ -293,19 +298,45 @@ if NVIDIA_API_KEY:
         "models_url": "",
         "can_fetch": False,
         "key": NVIDIA_API_KEY,
-        "default_model": "meta/llama-3.3-70b-instruct",
+        "default_model": "nvidia/nemotron-3-super-120b-a12b",
         "fallback": [
-            "meta/llama-3.3-70b-instruct",
-            "meta/llama-3.1-405b-instruct",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "openai/gpt-oss-120b",
             "deepseek-ai/deepseek-v3.2",
             "qwen/qwen3-235b-a22b",
-            "mistralai/mixtral-8x22b-instruct-v0.1",
+            "moonshotai/kimi-k2.5",
         ],
         "models": [],
     }
 
+if VERCEL_API_KEY:
+    PROVIDERS["vercel"] = {
+        "name": "Vercel",
+        "url": "https://ai-gateway.vercel.sh/v1/chat/completions",
+        "models_url": "https://ai-gateway.vercel.sh/v1/models",
+        "can_fetch": True,
+        "key": VERCEL_API_KEY,
+        "default_model": "perplexity/sonar",
+        "fallback": ["perplexity/sonar"],
+        "models": [],
+    }
+
+if CUSTOM_API_KEY and CUSTOM_BASE_URL and CUSTOM_DEFAULT_MODEL:
+    PROVIDERS["custom"] = {
+        "name": "Custom",
+        "url": CUSTOM_BASE_URL + "/v1/chat/completions",
+        "models_url": CUSTOM_BASE_URL + "/v1/models",
+        "can_fetch": True,
+        "key": CUSTOM_API_KEY,
+        "default_model": CUSTOM_DEFAULT_MODEL,
+        "fallback": [CUSTOM_DEFAULT_MODEL],
+        "models": [],
+    }
+
 # ============================================================================
-# DYNAMIC MODEL FETCHING
+# DYNAMIC MODEL FETCHING — lazy: boot seeds fallback lists, real fetch only
+# on /models, /refresh or provider operations that need the live list.
+# Fetching 3 providers' model JSON at boot was a startup RAM spike.
 # ============================================================================
 
 def _model_sort_key(model_id):
@@ -350,13 +381,13 @@ def fetch_models(provider_key):
         return None
 
 
-def refresh_all_models():
+def refresh_all_models(fetch=True):
     for key, prov in PROVIDERS.items():
         if wdt: wdt.feed()
-        if prov["can_fetch"]:
+        if fetch and prov["can_fetch"]:
             if fetch_models(key) is None:
                 prov["models"] = list(prov["fallback"])
-        else:
+        elif not prov["models"]:
             prov["models"] = list(prov["fallback"])
         gc.collect()
 
@@ -376,8 +407,9 @@ def get_models(provider_key):
 # GLOBAL STATE
 # ============================================================================
 
-AI_OK    = 0
-AI_ERROR = 1
+AI_OK               = 0
+AI_ERROR            = 1
+AI_TOOLS_UNSUPPORTED = 2   # provider/model rejected the tools parameter
 
 sessions       = {}
 boot_time      = 0
@@ -396,12 +428,12 @@ def wifi_connect():
     if wlan.isconnected():
         print("[WiFi] Already connected:", wlan.ifconfig()[0])
         return wlan
-    print("[WiFi] Connecting to", WIFI_SSID)
+    _log("[WiFi] Connecting to", WIFI_SSID)
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
     delay = 2
     while not wlan.isconnected():
         if wdt: wdt.feed()
-        print("[WiFi] Waiting %ds..." % delay)
+        _log("[WiFi] Waiting %ds..." % delay)
         time.sleep(delay)
         delay = min(delay * 2, 60)
         if not wlan.isconnected():
@@ -412,15 +444,14 @@ def wifi_connect():
 
 
 def sync_ntp():
-    import ntptime
     for server in ("pool.ntp.org", "time.google.com"):
         try:
             ntptime.host = server; ntptime.settime()
             t = time.localtime()
-            print("[NTP] %s: %04d-%02d-%02d %02d:%02d" % (server,t[0],t[1],t[2],t[3],t[4]))
+            _log("[NTP] %s: %04d-%02d-%02d %02d:%02d" % (server,t[0],t[1],t[2],t[3],t[4]))
             return
         except Exception as e:
-            print("[NTP] %s failed: %s" % (server, e))
+            _log("[NTP] %s failed: %s" % (server, e))
     print("[NTP] All servers failed")
 
 # ============================================================================
@@ -437,11 +468,11 @@ def update_duckdns():
     try:
         r = urequests.get(
             "https://www.duckdns.org/update?domains=%s&token=%s&verbose=true" % (DUCKDNS_DOMAIN, DUCKDNS_TOKEN))
-        result = r.text.strip(); r.close(); r = None
-        print("[DuckDNS]", result)
+        result = _read_body_limited(r, 256).strip(); r.close(); r = None
+        _log("[DuckDNS]", result)
         duckdns_status = "Running" if result.startswith("OK") else "Error: %s" % result.split("\n")[0]
     except Exception as e:
-        print("[DuckDNS] Error:", e)
+        _log("[DuckDNS] Error:", e)
         duckdns_status = "Error: %s" % str(e)
         if r:
             try: r.close()
@@ -454,15 +485,27 @@ def update_duckdns():
 
 TG_BASE = "https://api.telegram.org/bot" + TELEGRAM_TOKEN
 
+# %% escapes are required — this string goes through the % operator.
+# limit=5 + allowed_updates keeps the worst-case JSON payload tiny.
+# (Default is up to 100 updates of any type: a >100 KB heap bomb.)
+# edited_message is deliberately NOT filtered in: re-answering an edit costs
+# a full tool round-trip the C3 can't afford, and edited batches can move
+# tg_offset past text the user still expects a reply to.
+TG_POLL_URL = ("/getUpdates?timeout=25&limit=5"
+               "&allowed_updates=%%5B%%22message%%22%%5D"
+               "&offset=%d")
+
 
 def tg_get_updates(offset):
     r = None
     try:
-        r = urequests.get(TG_BASE + "/getUpdates?timeout=30&offset=%d" % offset)
+        r = urequests.get(TG_BASE + TG_POLL_URL % offset)
         data = r.json(); r.close(); r = None; gc.collect()
         if data.get("ok"):
             result = data.get("result", []); del data; return result
         del data
+        # API-level failure (401/502 HTML/etc.) — caller would re-poll instantly.
+        time.sleep(5)
     except Exception as e:
         print("[TG] getUpdates error:", e)
         if r:
@@ -470,6 +513,31 @@ def tg_get_updates(offset):
             except Exception: pass
         gc.collect()
     return []
+
+
+def tg_flush_updates():
+    """Fast-forward past the pending backlog on boot.
+
+    After a WDT reset tg_offset is 0, so Telegram re-delivers old messages
+    and the bot re-answers them. offset=-1 asks for just the latest update;
+    we ack it so polling resumes past it.
+    """
+    global tg_offset
+    r = None
+    try:
+        r = urequests.get(TG_BASE + "/getUpdates?timeout=0&limit=1&offset=-1")
+        data = r.json(); r.close(); r = None; gc.collect()
+        result = data.get("result") or []
+        if result:
+            tg_offset = result[-1].get("update_id", 0) + 1
+            print("[TG] Flushed backlog, offset=%d" % tg_offset)
+        del data
+    except Exception as e:
+        print("[TG] Flush error:", e)
+        if r:
+            try: r.close()
+            except Exception: pass
+    gc.collect()
 
 
 def tg_send(chat_id, text):
@@ -483,9 +551,13 @@ def tg_send(chat_id, text):
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
     if text: chunks.append(text)
+    n = len(chunks)
     for i, chunk in enumerate(chunks):
-        if len(chunks) > 1:
-            chunk = "[%d/%d]\n%s" % (i+1, len(chunks), chunk)
+        if n > 1:
+            # reserve prefix room BEFORE slicing judgment: "[99/99]\n" is 8 bytes
+            chunk = "[%d/%d]\n%s" % (i+1, n, chunk)
+        if len(chunk) > MAX_LEN:          # prefix pushed it over; trim tail
+            chunk = chunk[:MAX_LEN]
         for try_md in (True, False):
             obj = {"chat_id": chat_id, "text": chunk}
             if try_md: obj["parse_mode"] = "Markdown"
@@ -495,13 +567,14 @@ def tg_send(chat_id, text):
             try:
                 r = urequests.post(url, data=payload, headers={"Content-Type":"application/json"})
                 body = r.json(); r.close(); r = None
-                ok = bool(body.get("ok")); del body; gc.collect()
+                ok = bool(body.get("ok")); del body
             except Exception as e:
                 print("[TG] send error:", e)
                 if r:
                     try: r.close()
                     except Exception: pass
-            del payload; gc.collect()
+            del payload
+            gc.collect()
             if ok: break
 
 
@@ -519,85 +592,117 @@ def tg_send_action(chat_id):
     gc.collect()
 
 # ============================================================================
-# AI PROVIDER
+# AI PROVIDER — one chat-completion call with optional tools + retry.
+#
+# Returns (status, content, tool_calls):
+#   AI_OK                — content may be "", tool_calls may be [] or populated
+#   AI_ERROR             — content holds the error message
+#   AI_TOOLS_UNSUPPORTED — model/provider rejected the tools parameter;
+#                          caller should retry without tools and remember.
+# tool_calls entries are the RAW dicts from the response JSON — echoing them
+# back verbatim in Call 2 keeps Gemini's signed function calls intact.
 # ============================================================================
 
-def ai_chat(provider_key, model, messages, sys_prompt=None):
+def ai_chat(provider_key, model, messages, sys_prompt, tools=None):
     prov = PROVIDERS.get(provider_key)
     if not prov:
-        return AI_ERROR, "Error: provider '%s' not available." % provider_key
-    prompt = sys_prompt if sys_prompt is not None else SYSTEM_PROMPT
-    chat_msgs = [{"role":"system","content":prompt}]
+        return AI_ERROR, "Error: provider '%s' not available." % provider_key, None
+    chat_msgs = [{"role":"system","content":sys_prompt}]
     chat_msgs.extend(messages)
     body = {"model":model,"messages":chat_msgs,"temperature":TEMPERATURE,"max_tokens":MAX_TOKENS}
+    if tools: body["tools"] = tools
     headers = {"Content-Type":"application/json","Authorization":"Bearer "+prov["key"]}
     payload = ujson.dumps(body); del body, chat_msgs; gc.collect()
-    r = None
-    try:
-        r = urequests.post(prov["url"], data=payload, headers=headers)
-        del payload
-        data = r.json(); r.close(); r = None; gc.collect()
-        choices = data.get("choices")
-        if choices and len(choices) > 0:
-            content = choices[0].get("message",{}).get("content") or "(empty)"
-            del data
-            if len(content) > MAX_RESPONSE_LEN:
-                content = content[:MAX_RESPONSE_LEN] + "\n[truncated]"
-            return AI_OK, content
-        err = data.get("error"); del data
-        if err:
-            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-            return AI_ERROR, "API Error: %s" % msg
-        return AI_ERROR, "(no response from %s)" % prov["name"]
-    except Exception as e:
-        if r:
-            try: r.close()
-            except Exception: pass
-        gc.collect()
-        return AI_ERROR, "Error calling %s: %s" % (prov["name"], str(e))
 
-
-def ai_decide_search(provider_key, model, messages):
-    """Lightweight AI call: returns search query string or None (no search)."""
-    prov = PROVIDERS.get(provider_key)
-    if not prov:
-        return None
-    prompt = _make_search_decision_prompt()
-    chat_msgs = [{"role": "system", "content": prompt}]
-    chat_msgs.extend(messages)
-    body = {"model": model, "messages": chat_msgs, "temperature": 0.0, "max_tokens": 60}
-    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + prov["key"]}
-    payload = ujson.dumps(body); del body, chat_msgs; gc.collect()
-    r = None
     try:
-        r = urequests.post(prov["url"], data=payload, headers=headers)
-        del payload
-        data = r.json(); r.close(); r = None; gc.collect()
-        choices = data.get("choices")
-        if choices and len(choices) > 0:
-            content = choices[0].get("message", {}).get("content") or ""
-            del data
-            return _parse_search_query(content)
-        del data
-        return None
-    except Exception as e:
-        if r:
-            try: r.close()
-            except Exception: pass
+        for attempt in range(_CHAT_MAX_RETRIES + 1):
+            r = None
+            try:
+                r = urequests.post(prov["url"], data=payload, headers=headers)
+                data = r.json(); r.close(); r = None; gc.collect()
+                choices = data.get("choices")
+                if choices and len(choices) > 0:
+                    msg = choices[0].get("message", {}) or {}
+                    content = msg.get("content") or ""
+                    tcs = msg.get("tool_calls") or []
+                    del data
+                    if len(content) > MAX_RESPONSE_LEN:
+                        content = content[:MAX_RESPONSE_LEN] + "\n[truncated]"
+                        tcs = []   # truncated content can't pair with tool flow safely
+                    return AI_OK, content, tcs
+                err = data.get("error"); del data
+                if err:
+                    emsg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                else:
+                    emsg = "(no response from %s)" % prov["name"]
+                low = emsg.lower()
+                if tools and ("tool" in low or "function" in low):
+                    return AI_TOOLS_UNSUPPORTED, emsg, None
+                if attempt < _CHAT_MAX_RETRIES and _is_transient(low):
+                    if wdt: wdt.feed()
+                    wait = 3 * (1 << attempt)
+                    print("[Bot] Transient error (%s), retry in %ds" % (emsg, wait))
+                    time.sleep(wait)
+                    if wdt: wdt.feed()
+                    continue
+                return AI_ERROR, "API Error: %s" % emsg, None
+            except Exception as e:
+                if r:
+                    try: r.close()
+                    except Exception: pass
+                gc.collect()
+                emsg = str(e)
+                if attempt < _CHAT_MAX_RETRIES and _is_transient(emsg):
+                    if wdt: wdt.feed()
+                    time.sleep(3 * (1 << attempt))
+                    if wdt: wdt.feed()
+                    continue
+                return AI_ERROR, "Error calling %s: %s" % (prov["name"], emsg), None
+    finally:
+        del payload, headers
         gc.collect()
-        print("[Bot] Search decision error: %s" % e)
-        return None
+    return AI_ERROR, "(unreachable)", None
+
 
 # ============================================================================
-# WEB SEARCH
+# THINKING-TAG STRIPPER — pure string ops, no ure import (~2 KB saved).
+# Reasoning models (Qwen / DeepSeek / NVIDIA) leak <think> blocks into
+# the visible reply on OpenAI-compat endpoints.
+# ============================================================================
+
+def strip_thinking(text):
+    for tag in ("think", "thinking", "reasoning"):
+        open_t  = "<" + tag + ">"
+        close_t = "</" + tag + ">"
+        while True:
+            low = text.lower()
+            i = low.find(open_t)
+            if i == -1:
+                break
+            j = low.find(close_t, i)
+            if j == -1:
+                text = text[:i]      # unterminated block — drop to end
+                break
+            text = text[:i] + text[j + len(close_t):]
+    return text.strip()
+
+
+# ============================================================================
+# WEB SEARCH ENGINES
 # ============================================================================
 
 def _url_encode(s):
+    """RFC3986 quote_plus, allocation-lean: one pass over a bytes source,
+    appending multi-char fragments instead of one str object per byte."""
     out = []
+    add = out.append
     for b in s.encode('utf-8'):
-        if (65<=b<=90)or(97<=b<=122)or(48<=b<=57)or b in(45,46,95,126): out.append(chr(b))
-        elif b==32: out.append('+')
-        else: out.append('%%%02X'%b)
+        if (65<=b<=90)or(97<=b<=122)or(48<=b<=57)or b in (45,46,95,126):
+            add(chr(b))
+        elif b == 32:
+            add('+')
+        else:
+            add('%%%02X' % b)
     return ''.join(out)
 
 
@@ -614,6 +719,19 @@ def _strip_tags(html_str):
     return text.strip()
 
 
+def _read_body_limited(r, limit):
+    """Read at most `limit` bytes of a response body.
+
+    r.text/.content buffer the ENTIRE body — fatal for a 60-100 KB HTML
+    page on a 400 KB chip. Reading the raw socket caps the allocation.
+    """
+    try:
+        data = r.raw.read(limit)
+        return data.decode('utf-8', 'ignore') if isinstance(data, bytes) else (data or "")
+    except AttributeError:
+        return (r.text or "")[:limit]
+
+
 def brave_search(query):
     if not BRAVE_API_KEY: return []
     r = None
@@ -622,10 +740,13 @@ def brave_search(query):
             "https://api.search.brave.com/res/v1/web/search?q=%s&count=%d" % (_url_encode(query), MAX_SEARCH_RESULTS),
             headers={"Accept":"application/json","X-Subscription-Token":BRAVE_API_KEY})
         data = r.json(); r.close(); r = None; gc.collect()
-        results = data.get("web",{}).get("results",[])
-        snippets = [(item.get("title",""), item.get("description","")[:MAX_SNIPPET_LEN])
-                    for item in results if item.get("title") or item.get("description")]
-        del data, results; gc.collect()
+        snippets = []
+        for item in data.get("web",{}).get("results",[]):
+            title = (item.get("title","") or "").strip()
+            desc  = (item.get("description","") or "").strip()[:MAX_SNIPPET_LEN]
+            if title and len(desc) >= 15:
+                snippets.append("%s: %s" % (title, desc))
+        del data; gc.collect()
         print("[Search] Brave '%s' -> %d" % (query, len(snippets)))
         return snippets
     except Exception as e:
@@ -637,31 +758,67 @@ def brave_search(query):
         return []
 
 
-def duckduckgo_search(query):
+def searxng_search(query):
+    if not SEARXNG_URL: return []
     r = None
     try:
-        r = urequests.get("https://html.duckduckgo.com/html/?q=%s" % _url_encode(query),
+        r = urequests.get(
+            "%s/search?q=%s&format=json&count=%d" % (SEARXNG_URL, _url_encode(query), MAX_SEARCH_RESULTS),
+            headers={"Accept":"application/json"})
+        data = r.json(); r.close(); r = None; gc.collect()
+        snippets = []
+        for item in data.get("results", [])[:MAX_SEARCH_RESULTS]:
+            title = (item.get("title","") or "").strip()
+            content = (item.get("content","") or "").strip()[:MAX_SNIPPET_LEN]
+            if title and len(content) >= 15:
+                snippets.append("%s: %s" % (title, content))
+        del data; gc.collect()
+        print("[Search] SearXNG '%s' -> %d" % (query, len(snippets)))
+        return snippets
+    except Exception as e:
+        print("[Search] SearXNG error: %s" % e)
+        if r:
+            try: r.close()
+            except Exception: pass
+        gc.collect()
+        return []
+
+
+def duckduckgo_search(query):
+    """DuckDuckGo via the lite endpoint.
+
+    lite.duckduckgo.com/lite/ returns a small table-based page (~10-25 KB)
+    vs 60-100 KB for html.duckduckgo.com/html/. Read is additionally capped
+    at 20 KB — the first 3 results live at the top, so truncation is safe.
+    """
+    r = None
+    try:
+        r = urequests.get("https://lite.duckduckgo.com/lite/?q=%s" % _url_encode(query),
                           headers={"User-Agent":"Mozilla/5.0"})
-        html = r.text; r.close(); r = None; gc.collect()
+        html = _read_body_limited(r, 20480)
+        r.close(); r = None; gc.collect()
         snippets, pos = [], 0
         while len(snippets) < MAX_SEARCH_RESULTS:
-            pos = html.find('class="result__a"', pos)
+            pos = html.find("result-link", pos)
             if pos == -1: break
             tag_end = html.find('>', pos)
             if tag_end == -1: break
             title_end = html.find('</a>', tag_end+1)
             if title_end == -1: break
             title = _strip_tags(html[tag_end+1:title_end])
-            snip_pos = html.find('class="result__snippet', pos)
-            next_r   = html.find('class="result__a"', title_end+1)
+            snip_pos = html.find("result-snippet", title_end)
+            next_r   = html.find("result-link", title_end+1)
             desc = ""
             if snip_pos != -1 and (next_r == -1 or snip_pos < next_r):
                 se = html.find('>', snip_pos)
                 if se != -1:
-                    end = html.find('</a>', se+1)
-                    if end == -1: end = html.find('</td>', se+1)
+                    end = html.find('</td>', se+1)
                     if end != -1: desc = _strip_tags(html[se+1:end])[:MAX_SNIPPET_LEN]
-            if title: snippets.append((title, desc))
+            if title and len(desc) >= 15:
+                snippets.append("%s: %s" % (title, desc))
+            elif title and len(snippets) < MAX_SEARCH_RESULTS and not desc:
+                # result with no snippet block at all — keep title-only
+                snippets.append(title)
             pos = title_end+1
         del html; gc.collect()
         print("[Search] DDG '%s' -> %d" % (query, len(snippets)))
@@ -675,10 +832,173 @@ def duckduckgo_search(query):
         return []
 
 
+def exa_search(query):
+    """Exa answer endpoint — a synthesized, ready-to-read answer via HTTPS POST.
+
+    Lighter than scraping for the C3: replaces 'fetch 20 KB HTML + parse' with
+    one small JSON POST/response. Citations are dropped at the source so the
+    chat model never echoes them into Telegram replies (bot.py contract).
+    """
+    if not EXA_API_KEY: return []
+    r = None
+    try:
+        body = {"model": "exa", "messages": [{"role": "user", "content": query}]}
+        payload = ujson.dumps(body); del body
+        r = urequests.post(
+            "https://api.exa.ai/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + EXA_API_KEY})
+        data = r.json(); r.close(); r = None; del payload; gc.collect()
+        choices = data.get("choices") or []
+        answer = ""
+        if choices:
+            answer = ((choices[0].get("message") or {}).get("content") or "").strip()
+        del data; gc.collect()
+        if not answer:
+            print("[Search] Exa '%s' -> empty answer" % query)
+            return []
+        print("[Search] Exa '%s' -> %d chars" % (query, len(answer)))
+        return [answer[:MAX_ANSWER_LEN]]
+    except Exception as e:
+        print("[Search] Exa error: %s" % e)
+        if r:
+            try: r.close()
+            except Exception: pass
+        gc.collect()
+        return []
+
+
 def web_search(query, engine):
+    """Engine preference with DDG as universal fallback (from bot.py)."""
+    if engine == "exa" and EXA_API_KEY:
+        res = exa_search(query)
+        if res: return res
+        print("[Search] Exa empty, falling back to DDG")
     if engine == "brave" and BRAVE_API_KEY:
-        return brave_search(query)
+        res = brave_search(query)
+        if res: return res
+        print("[Search] Brave empty, falling back to DDG")
+    if engine == "searxng" and SEARXNG_URL:
+        res = searxng_search(query)
+        if res: return res
+        print("[Search] SearXNG empty, falling back to DDG")
     return duckduckgo_search(query)
+
+
+# ============================================================================
+# FUNCTION-CALLING SEARCH FLOW (ported from bot.py)
+#
+#   Call 1 — chat completion with WEB_SEARCH_TOOL attached:
+#     - model answers directly        -> done in 1 call
+#     - model emits tool_calls        -> execute search, inject result, Call 2
+#   Call 2 — follow-up with tool result, tools removed:
+#     - model answers using the search data
+#
+# FALLBACK: model/provider without tool support -> AI_TOOLS_UNSUPPORTED ->
+# session flag "no_tools" set, plain single call from then on.
+# ============================================================================
+
+_NO_RESULTS_MSG = (
+    "The web search for '%s' returned no usable results. "
+    "Tell the user plainly that you could not find current "
+    "information on this topic, and do NOT answer from memory."
+)
+
+
+def _format_search_results(query, snippets):
+    t = time.localtime()
+    today = "%04d-%02d-%02d" % (t[0], t[1], t[2])
+    parts = ["Today is %s. Web search results for '%s':" % (today, query)]
+    for i, snip in enumerate(snippets):
+        parts.append("%d. %s" % (i+1, snip))
+    parts.append(
+        "\nAnswer using ONLY the information above. If it does not answer the "
+        "question, say so plainly instead of filling gaps from memory."
+    )
+    return "\n".join(parts)
+
+
+def _parse_tool_call(tc):
+    """Normalize a raw tool_calls entry -> (name, args_dict, call_id)."""
+    fn = tc.get("function") or {}
+    name = fn.get("name", "")
+    args = fn.get("arguments", "")
+    if isinstance(args, str):
+        try: args = ujson.loads(args)
+        except Exception: args = {}
+    if not isinstance(args, dict): args = {}
+    return name, args, tc.get("id") or "call_0"
+
+
+def ai_chat_with_search(s):
+    """Full message flow for a session (history already holds the new user msg).
+
+    Returns (AI_OK, final_text) or (AI_ERROR, error_text).
+    """
+    provider_key = s["provider"]
+    model        = s["model"]
+    sys_prompt   = _build_system_prompt()
+    use_tools    = s.get("web_search", True) and not s.get("no_tools")
+    tools        = [WEB_SEARCH_TOOL] if use_tools else None
+
+    # Fold compacted memory in front of any surviving verbatim history — one
+    # ~400-byte message, so the chat call sees old context without the bulk.
+    req = list(s["history"])
+    if s.get("summary"):
+        req.insert(0, {"role": "system",
+                       "content": "Conversation so far (summary): " + s["summary"]})
+
+    # ── Call 1 ──────────────────────────────────────────────────────────
+    status, content, tcs = ai_chat(provider_key, model, req, sys_prompt, tools)
+
+    if status == AI_TOOLS_UNSUPPORTED:
+        print("[Bot] %s/%s rejected tools — disabling for this session" % (provider_key, model))
+        s["no_tools"] = True
+        status, content, tcs = ai_chat(provider_key, model, req, sys_prompt)
+
+    if status != AI_OK:
+        return AI_ERROR, content
+
+    # ── Direct answer, no tool call ─────────────────────────────────────
+    if not tcs:
+        return AI_OK, strip_thinking(content)
+
+    # ── Tool call — execute the first one (web_search is the only tool) ──
+    name, args, call_id = _parse_tool_call(tcs[0])
+    if name == "web_search":
+        query = (args.get("query") or "").strip()
+        if query:
+            engine = s.get("search_engine", "duckduckgo")
+            print("[FuncCall] web_search('%s') via %s" % (query, engine))
+            if wdt: wdt.feed()
+            snippets = web_search(query, engine)
+            tool_result = _format_search_results(query, snippets) if snippets else _NO_RESULTS_MSG % query
+            del snippets
+        else:
+            tool_result = "Error: web_search called with empty query."
+    else:
+        tool_result = "Unknown tool: %s" % name
+    gc.collect()
+
+    # OpenAI spec: append the assistant message WITH the raw tool_calls,
+    # then the tool result, then call again without tools.
+    follow = list(req)
+    follow.append({"role": "assistant",
+                   "content": content or None,
+                   "tool_calls": [tcs[0]]})
+    follow.append({"role": "tool",
+                   "tool_call_id": call_id,
+                   "content": tool_result})
+    del tool_result
+    if wdt: wdt.feed()
+
+    # ── Call 2 — final answer from search results ───────────────────────
+    status2, content2, _ = ai_chat(provider_key, model, follow, sys_prompt)
+    del follow, req; gc.collect()
+    if status2 != AI_OK:
+        return AI_ERROR, content2
+    return AI_OK, strip_thinking(content2)
 
 # ============================================================================
 # SESSION MANAGEMENT
@@ -690,13 +1010,18 @@ def get_session(user_id):
             oldest = min(sessions, key=lambda uid: sessions[uid]["last_msg_time"])
             del sessions[oldest]; gc.collect()
         prov = DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else next(iter(PROVIDERS), "")
-        eng  = "brave" if BRAVE_API_KEY else "duckduckgo"
+        if EXA_API_KEY: eng = "exa"
+        elif BRAVE_API_KEY: eng = "brave"
+        elif SEARXNG_URL: eng = "searxng"
+        else: eng = "duckduckgo"
         sessions[user_id] = {
             "provider": prov,
             "model":    PROVIDERS[prov]["default_model"] if prov else "",
             "history":  [],
+            "summary":  "",
             "web_search":    True,
             "search_engine": eng,
+            "no_tools":      False,
             "last_msg_time": 0,
         }
     return sessions[user_id]
@@ -714,7 +1039,7 @@ def handle_command(chat_id, text, user_id):
 
     if cmd == "/start":
         tg_send(chat_id,
-            "ESP32-C3 AI Bot v4\n\nProvider: %s\nModel: %s\nAvailable: %s\n\nType /help." %
+            "ESP32-C3 AI Bot v6 (function calling)\n\nProvider: %s\nModel: %s\nAvailable: %s\n\nType /help." %
             (s["provider"], s["model"], ", ".join(PROVIDERS.keys())))
         return True
 
@@ -726,14 +1051,14 @@ def handle_command(chat_id, text, user_id):
             "/model [id] — switch model\n"
             "/refresh — re-fetch model lists\n"
             "/clear — clear history\n"
-            "/web [on|off|brave|ddg] — search toggle\n"
+            "/web [on|off|exa|brave|searxng|ddg] — search toggle\n"
             "/status — device info\n"
             "/help — this message\n\nJust type to chat!")
         return True
 
     if cmd == "/provider":
         if not arg:
-            tg_send(chat_id, "Current: %s\nAvailable: %s\n\nUse: /provider <n>" %
+            tg_send(chat_id, "Current: %s\nAvailable: %s\n\nUse: /provider <name>" %
                     (s["provider"], ", ".join(PROVIDERS.keys())))
             return True
         al = arg.lower()
@@ -743,6 +1068,8 @@ def handle_command(chat_id, text, user_id):
         s["provider"] = al
         s["model"]    = PROVIDERS[al]["default_model"]
         s["history"]  = []
+        s["summary"]  = ""
+        s["no_tools"] = False
         tg_send(chat_id, "Switched to %s\nModel: %s\nHistory cleared." % (PROVIDERS[al]["name"], s["model"]))
         return True
 
@@ -759,7 +1086,7 @@ def handle_command(chat_id, text, user_id):
 
     if cmd == "/refresh":
         tg_send(chat_id, "Refreshing...")
-        refresh_all_models()
+        refresh_all_models(fetch=True)
         lines = ["Refreshed:"]
         for k, p in PROVIDERS.items():
             lines.append("- %s: %d (%s)" % (p["name"], len(p["models"]), "API" if p["can_fetch"] else "hardcoded"))
@@ -771,7 +1098,11 @@ def handle_command(chat_id, text, user_id):
             tg_send(chat_id, "Current: %s\nUse: /model <id>" % s["model"])
             return True
         models = get_models(s["provider"])
+        if not models:
+            tg_send(chat_id, "Model list unavailable (fetch failed) — try /refresh first.")
+            return True
         s["model"] = arg
+        s["no_tools"] = False   # new model may support tools
         if arg in models:
             tg_send(chat_id, "Switched to: %s" % arg)
         else:
@@ -779,8 +1110,8 @@ def handle_command(chat_id, text, user_id):
         return True
 
     if cmd == "/clear":
-        s["history"] = []; gc.collect()
-        tg_send(chat_id, "History cleared.")
+        s["history"] = []; s["summary"] = ""; gc.collect()
+        tg_send(chat_id, "History and summary cleared.")
         return True
 
     if cmd == "/status":
@@ -800,66 +1131,123 @@ def handle_command(chat_id, text, user_id):
                 except Exception: pass
         gc.collect()
         fr = gc.mem_free(); ua = gc.mem_alloc(); tot = fr+ua
+        eng  = s.get("search_engine","duckduckgo")
+        eng_name = {"exa":"Exa","brave":"Brave","searxng":"SearXNG"}.get(eng,"DuckDuckGo")
         tg_send(chat_id,
             "ESP32-C3 Status\n\n"
             "WiFi: %s\nRSSI: %s\nIP: %s\nPublic: %s\n"
             "DuckDNS: %s\nUptime: %dh %dm\nCPU: %d MHz\n"
             "RAM: %d/%d (%d%%)\nProvider: %s\nModel: %s\n"
-            "History: %d msgs\nWeb search: %s (%s)" % (
+            "History: %d msgs\nSummary: %s\nWeb search: %s (%s)%s" % (
                 WIFI_SSID, rssi,
                 wlan.ifconfig()[0] if wlan.isconnected() else "disconnected",
                 pub_ip, duckdns_status,
                 uptime//3600, (uptime%3600)//60, freq()//1000000,
                 ua, tot, (ua*100)//tot if tot else 0,
                 s["provider"], s["model"], len(s["history"]),
+                ("%d chars" % len(s["summary"])) if s.get("summary") else "none",
                 "ON" if s.get("web_search") else "OFF",
-                "Brave" if s.get("search_engine")=="brave" else "DuckDuckGo"))
+                eng_name,
+                ", tools unsupported" if s.get("no_tools") else ""))
         return True
 
     if cmd == "/web":
         if not arg:
             eng = s.get("search_engine","duckduckgo")
+            eng_name = {"exa":"Exa","brave":"Brave API","searxng":"SearXNG"}.get(eng,"DuckDuckGo")
             tg_send(chat_id,
-                "Web search: %s\nEngine: %s\n\n/web on|off\n/web brave\n/web ddg" % (
-                    "ON" if s.get("web_search") else "OFF",
-                    "Brave API" if eng=="brave" else "DuckDuckGo"))
+                "Web search: %s\nEngine: %s\n\n/web on|off\n/web exa\n/web brave\n/web searxng\n/web ddg" % (
+                    "ON" if s.get("web_search") else "OFF", eng_name))
             return True
         a = arg.lower()
         if a=="on":
             s["web_search"]=True
-            tg_send(chat_id,"Web search enabled (%s)." % ("Brave" if s.get("search_engine")=="brave" else "DDG"))
+            tg_send(chat_id,"Web search enabled.")
         elif a=="off":
             s["web_search"]=False; tg_send(chat_id,"Web search disabled.")
+        elif a=="exa":
+            if not EXA_API_KEY: tg_send(chat_id,"EXA_API_KEY not configured.")
+            else: s["search_engine"]="exa"; s["web_search"]=True; tg_send(chat_id,"Switched to Exa (synthesized answer, a bit slower).")
         elif a=="brave":
-            if not BRAVE_API_KEY: tg_send(chat_id,"Brave API key not configured. Use /web ddg.")
+            if not BRAVE_API_KEY: tg_send(chat_id,"Brave API key not configured.")
             else: s["search_engine"]="brave"; s["web_search"]=True; tg_send(chat_id,"Switched to Brave.")
+        elif a=="searxng":
+            if not SEARXNG_URL: tg_send(chat_id,"SEARXNG_URL not configured.")
+            else: s["search_engine"]="searxng"; s["web_search"]=True; tg_send(chat_id,"Switched to SearXNG.")
         elif a in("ddg","duckduckgo"):
             s["search_engine"]="duckduckgo"; s["web_search"]=True; tg_send(chat_id,"Switched to DuckDuckGo.")
         else:
-            tg_send(chat_id,"Use: /web on|off|brave|ddg")
+            tg_send(chat_id,"Use: /web on|off|exa|brave|searxng|ddg")
         return True
 
     tg_send(chat_id, "Unknown: %s\nTry /help" % cmd)
     return True
 
 # ============================================================================
-# MESSAGE HANDLER — AI-routed search
-#
-# 1. Quick filter: greetings / very short → 1 AI call (no search overhead)
-# 2. Everything else → 1 lightweight decision call (SEARCH/NOSEARCH)
-#    → NOSEARCH: 1 AI call with full system prompt
-#    → SEARCH:   web search → 1 AI call with results + full system prompt
+# MESSAGE HANDLER
 # ============================================================================
 
-def _build_search_context(query, results):
-    t = time.localtime()
-    today = "%04d-%02d-%02d" % (t[0], t[1], t[2])
-    parts = ["Today is %s. Web search results for '%s':" % (today, query)]
-    for i, (title, desc) in enumerate(results):
-        line = "%d. %s" % (i+1, title)
-        if desc: line += ": %s" % desc
-        parts.append(line)
-    return '\n'.join(parts)
+_SUMMARIZER_PROMPT = (
+    "Compress this conversation prefix into at most %d characters of durable "
+    "facts about the user and the discussion: names, goals, constraints, "
+    "decisions made, unresolved questions. Rewrite the existing summary with "
+    "the new material merged in — do not append. Output ONLY the summary text, "
+    "no preamble."
+) % MAX_SUMMARY_CHARS
+
+
+def _serialize_for_summary(messages):
+    """Role-prefixed one-line-per-message rendering, clipped for the summarizer."""
+    parts = []
+    for m in messages:
+        role = "User" if m.get("role") == "user" else "Assistant"
+        content = (m.get("content") or "").replace("\n", " ")
+        parts.append("%s: %s" % (role, content[:600]))
+    return "\n".join(parts)
+
+
+def _summarize_prefix(session, prefix_messages, provider_key, model):
+    """One extra LLM call: fold prefix_messages (+ old summary) into a <=MAX_SUMMARY_CHARS note."""
+    old = session.get("summary", "")
+    user_payload = _serialize_for_summary(prefix_messages)
+    if old:
+        user_payload = ("Existing summary:\n%s\n\nNew messages to merge:\n%s"
+                        % (old, user_payload))
+    msgs = [{"role": "user", "content": user_payload}]
+    status, content, _ = ai_chat(provider_key, model, msgs,
+                                 _SUMMARIZER_PROMPT, tools=None)
+    del msgs, user_payload, prefix_messages; gc.collect()
+    if status != AI_OK or not content:
+        return old   # keep old summary on failure
+    return content.strip()[:MAX_SUMMARY_CHARS]
+
+
+def _compact_if_needed(session):
+    """Called AFTER the user message is appended, BEFORE the chat call.
+
+    If history exceeds the threshold, fold the oldest turns into a rolling
+    summary so the chat call receives summary + recent verbatim messages
+    instead of losing the oldest context entirely.
+    """
+    if len(session["history"]) <= COMPACT_THRESHOLD:
+        return
+    # Tasks a single TLS session must pull off; skip when the heap is tight.
+    if gc.mem_free() < COMPACT_MIN_FREE:
+        print("[Compact] heap low (%d) — plain trim" % gc.mem_free())
+        _trim_history(session["history"])
+        return
+    cut = len(session["history"]) - COMPACT_KEEP_RECENT
+    if cut < 2:
+        return   # need at least one user+assistant pair to be worth summarizing
+    prefix = session["history"][:cut]
+    session["history"] = session["history"][cut:]
+    if wdt: wdt.feed()
+    print("[Compact] folding %d msgs into summary" % cut)
+    session["summary"] = _summarize_prefix(
+        session, prefix, session["provider"], session["model"])
+    del prefix; gc.collect()
+    # Paranoia belt: if anything above left history over-threshold, hard-trim.
+    _trim_history(session["history"])
 
 
 def _trim_history(history):
@@ -871,6 +1259,10 @@ def _trim_history(history):
     return history
 
 
+def _clip(text):
+    return text if len(text) <= HISTORY_MSG_MAX else text[:HISTORY_MSG_MAX]
+
+
 def handle_message(chat_id, text, user_id):
     s = get_session(user_id)
 
@@ -880,10 +1272,11 @@ def handle_message(chat_id, text, user_id):
         return
     s["last_msg_time"] = now
 
-    # Emergency memory cleanup — evict another user's session if critically low
-    if gc.mem_free() < 20000:
+    # Emergency memory cleanup — evict another user's session if critically low.
+    # Floor is 40 KB: a single TLS handshake already needs ~30-40 KB.
+    if gc.mem_free() < MEM_FLOOR:
         gc.collect()
-        if gc.mem_free() < 20000:
+        if gc.mem_free() < MEM_FLOOR:
             for uid in list(sessions):
                 if uid != user_id:
                     del sessions[uid]
@@ -891,54 +1284,16 @@ def handle_message(chat_id, text, user_id):
                     print("[MEM] Freed session for %d, %d bytes free" % (uid, gc.mem_free()))
                     break
 
-    if len(text) > MAX_RESPONSE_LEN:
-        text = text[:MAX_RESPONSE_LEN]
+    s["history"].append({"role":"user","content":_clip(text)})
 
-    s["history"].append({"role":"user","content":text})
+    # Fold oldest turns into the rolling summary BEFORE the reply call —
+    # a plain 6-message window would otherwise silently forget them.
+    _compact_if_needed(s)
 
     tg_send_action(chat_id)
     if wdt: wdt.feed()
 
-    web_on = s.get("web_search", True)
-    skip   = not web_on or _skip_search_decision(text)
-    search_query = None
-
-    # ── AI SEARCH DECISION ───────────────────────────────────────────────
-    if not skip:
-        print("[Bot] Asking AI for search decision...")
-        tg_send_action(chat_id)
-        if wdt: wdt.feed()
-        search_query = ai_decide_search(s["provider"], s["model"], s["history"])
-        print("[Bot] Decision: %s" % ("SEARCH '%s'" % search_query if search_query else "NOSEARCH"))
-
-    result_type = AI_OK
-    response    = ""
-
-    # ── SEARCH PATH ──────────────────────────────────────────────────────
-    if search_query:
-        engine = s.get("search_engine", "duckduckgo")
-        print("[Bot] Searching (%s): '%s'" % (engine, search_query))
-        tg_send_action(chat_id)
-        if wdt: wdt.feed()
-        results = web_search(search_query, engine)
-        if results:
-            ctx = _build_search_context(search_query, results); del results; gc.collect()
-            search_msgs = list(s["history"][:-1])
-            search_msgs.append({"role":"user","content":text+"\n\n"+ctx})
-            tg_send_action(chat_id)
-            if wdt: wdt.feed()
-            result_type, response = ai_chat(
-                s["provider"], s["model"], search_msgs, SYSTEM_PROMPT_WITH_RESULTS)
-            del search_msgs, ctx; gc.collect()
-        else:
-            del results; gc.collect()
-            if wdt: wdt.feed()
-            result_type, response = ai_chat(s["provider"], s["model"], s["history"])
-
-    # ── NO-SEARCH PATH ───────────────────────────────────────────────────
-    else:
-        if wdt: wdt.feed()
-        result_type, response = ai_chat(s["provider"], s["model"], s["history"])
+    result_type, response = ai_chat_with_search(s)
 
     # ── Empty response fallback ──────────────────────────────────────────
     if result_type == AI_OK and not response.strip():
@@ -946,13 +1301,14 @@ def handle_message(chat_id, text, user_id):
 
     # ── Update history or roll back on error ─────────────────────────────
     if result_type == AI_OK:
-        s["history"].append({"role":"assistant","content":response})
+        s["history"].append({"role":"assistant","content":_clip(response)})
         _trim_history(s["history"])
     else:
         if s["history"] and s["history"][-1].get("role") == "user":
             s["history"].pop()
         print("[Bot] AI error — user message rolled back")
 
+    tg_send_action(chat_id)
     tg_send(chat_id, response)
     del response; gc.collect()
 
@@ -965,7 +1321,7 @@ def main():
 
     boot_time = time.time()
     print("=" * 40)
-    print("ESP32-C3 Telegram Bot v4 starting...")
+    print("ESP32-C3 Telegram Bot v6 starting...")
     print("Providers:", ", ".join(PROVIDERS.keys()) if PROVIDERS else "NONE!")
     print("=" * 40)
 
@@ -981,15 +1337,19 @@ def main():
     last_duckdns = 0
     update_duckdns()
 
-    print("[Bot] Fetching model lists...")
-    refresh_all_models()
-    print("[Bot] Starting Telegram polling...")
+    # Seed fallback model lists only — no HTTPS fetch at boot (RAM spike).
+    refresh_all_models(fetch=False)
+
+    # Skip any messages queued while the bot was down/rebooting.
+    tg_flush_updates()
+
+    print("[Bot] Polling... free heap: %d" % gc.mem_free())
 
     while True:
         wdt.feed()
         if not wlan.isconnected():
-            print("[WiFi] Lost, reconnecting...")
-            wlan = wifi_connect(); sync_ntp()
+            _log("[WiFi] Lost, reconnecting...")
+            wlan = wifi_connect(); wdt.feed(); sync_ntp()
             last_duckdns = 0; update_duckdns()
         update_duckdns()
         try:
@@ -999,7 +1359,7 @@ def main():
         for upd in updates:
             if wdt: wdt.feed()
             tg_offset = upd.get("update_id", 0) + 1
-            msg = upd.get("message") or upd.get("edited_message")
+            msg = upd.get("message")
             if not msg: continue
             chat_id = msg.get("chat",{}).get("id")
             text    = msg.get("text","")
