@@ -839,11 +839,6 @@ class GroqProvider(AIProvider):
         return any(keyword in model_id.lower() for keyword in reasoning_keywords)
 
 
-    def supports_thinking(self, model_id: str) -> bool:
-        reasoning_keywords = ["reasoning", "think", "deepseek", "qwq", "r1", "gemini-2"]
-        return any(keyword in model_id.lower() for keyword in reasoning_keywords)
-
-
 class OpenRouterProvider(AIProvider):
     def __init__(self, api_key: str):
         super().__init__()
